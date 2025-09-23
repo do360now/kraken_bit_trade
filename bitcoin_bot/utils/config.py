@@ -4,18 +4,18 @@ from dotenv import load_dotenv
 # Load environment variables from the .env file
 load_dotenv()
 
-# Bitvavo API credentials
-BITVAVO_API_KEY = os.getenv("BITVAVO_API_KEY")
-BITVAVO_API_SECRET = os.getenv("BITVAVO_API_SECRET")
+# Kraken API credentials
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY")
+KRAKEN_API_SECRET = os.getenv("KRAKEN_API_SECRET")
 
 # Ensure critical environment variables are set
-if not BITVAVO_API_KEY or not BITVAVO_API_SECRET:
+if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
     raise ValueError(
-        "BITVAVO_API_KEY or BITVAVO_API_SECRET is missing. Please check your environment variables."
+        "KRAKEN_API_KEY or KRAKEN_API_SECRET is missing. Please check your environment variables."
     )
 
-# API-related constants for Bitvavo
-API_DOMAIN = "https://api.bitvavo.com"
+# API-related constants for Kraken
+API_DOMAIN = "https://api.kraken.com"
 
 # Allocation strategy for portfolio management
 ALLOCATIONS = {
