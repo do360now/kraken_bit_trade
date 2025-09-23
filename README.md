@@ -1,11 +1,11 @@
-# 🤖 Bitcoin Trading Bot - Bitvavo Edition
+# 🤖 Bitcoin Trading Bot - Kraken Edition
 
-An advanced, AI-powered Bitcoin trading bot with machine learning capabilities, risk management, and comprehensive market analysis. Built specifically for the Bitvavo exchange with enhanced features for automated Bitcoin accumulation.
+An advanced, AI-powered Bitcoin trading bot with machine learning capabilities, risk management, and comprehensive market analysis. Built specifically for the Kraken exchange with enhanced features for automated Bitcoin accumulation.
 
 ## 🚀 Features
 
 ### Core Trading Features
-- **Automated Bitcoin Trading** on Bitvavo exchange
+- **Automated Bitcoin Trading** on Kraken exchange
 - **Smart Position Sizing** with risk-adjusted calculations
 - **Advanced Order Management** with timeout handling and fill tracking
 - **15-minute Trading Intervals** with precise scheduling
@@ -45,7 +45,7 @@ The bot tracks and optimizes based on:
 
 ### Prerequisites
 - Python 3.8+
-- Bitvavo API credentials
+- Kraken API credentials
 - Bitcoin node (optional, for on-chain analysis)
 - News API key (optional, for enhanced sentiment analysis)
 
@@ -270,7 +270,7 @@ This software is for educational and research purposes. The authors are not resp
 ## 🙏 Acknowledgments
 
 - [CCXT](https://github.com/ccxt/ccxt) for exchange connectivity
-- [Bitvavo](https://bitvavo.com) for reliable API services
+- [Kraken](https://bitvavo.com) for reliable API services
 - [scikit-learn](https://scikit-learn.org/) for machine learning tools
 - The Bitcoin and cryptocurrency community for inspiration
 
