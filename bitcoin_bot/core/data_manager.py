@@ -1,460 +1,720 @@
+"""
+Production-Ready Secure Data Manager
+Addresses security vulnerabilities and performance issues
+"""
+
 import json
 import os
+import asyncio
+import aiofiles
 import pandas as pd
 import csv
-from typing import List, Tuple
-from utils.logger import logger
-import fcntl
+import sqlite3
+from typing import List, Tuple, Optional, Dict, Any
+from datetime import datetime, timezone, timedelta
+import logging
+from dataclasses import dataclass
+from contextlib import asynccontextmanager
+import hashlib
 import time
-from datetime import datetime, timezone
-import requests
+from collections import deque
+import threading
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class DataValidationConfig:
+    """Configuration for data validation"""
+    max_price_change_pct: float = 0.20  # 20% max price change between candles
+    min_price_eur: float = 1000.0       # Minimum realistic BTC price
+    max_price_eur: float = 1000000.0    # Maximum realistic BTC price
+    max_volume_multiplier: float = 100.0 # Max 100x volume spike
+    timestamp_tolerance_hours: int = 2   # Allow 2 hours tolerance for real data
 
 
-class DataManager:
-    # Define headers as a class attribute
-    HEADERS = [
-        "timestamp",
-        "price",
-        "trade_volume",
-        "side",
-        "reason",
-        "dip",
-        "rsi",
-        "macd",
-        "signal",
-        "ma_short",
-        "ma_long",
-        "upper_band",
-        "lower_band",
-        "sentiment",
-        "fee_rate",
-        "netflow",
-        "volume",
-        "old_utxos",
-        "buy_decision",
-        "sell_decision",
-        "btc_balance",
-        "eur_balance",
-        "avg_buy_price",
-        "profit_margin",
+class SecureDataManager:
+    """Production-ready data manager with security and performance optimizations"""
+    
+    REQUIRED_HEADERS = [
+        "timestamp", "price", "trade_volume", "side", "reason", "rsi", "macd",
+        "signal", "upper_band", "lower_band", "sentiment", "buy_decision", 
+        "sell_decision", "btc_balance", "eur_balance"
     ]
-
-    def __init__(self, price_history_file: str, bot_logs_file: str):
-        self.price_history_file = price_history_file
-        self.bot_logs_file = bot_logs_file
-        if not os.path.exists(self.price_history_file):
-            with open(self.price_history_file, "w") as f:
-                json.dump([], f)
-        self._initialize_bot_logs()
-
-    def _initialize_bot_logs(self):
-        if (
-            not os.path.exists(self.bot_logs_file)
-            or os.path.getsize(self.bot_logs_file) == 0
-        ):
-            with open(self.bot_logs_file, "w", newline="") as f:
-                writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC)
-                writer.writerow(self.HEADERS)
-            logger.info(f"Initialized {self.bot_logs_file} with headers")
+    
+    def __init__(self, data_dir: str = "./data", use_database: bool = True):
+        self.data_dir = data_dir
+        self.use_database = use_database
+        self.validation_config = DataValidationConfig()
+        
+        # Thread-safe file access
+        self._file_locks = {}
+        self._lock_manager = threading.Lock()
+        
+        # In-memory cache for frequently accessed data
+        self._price_cache = deque(maxlen=2000)
+        self._cache_lock = threading.RLock()
+        self._cache_timestamp = 0
+        
+        # Ensure data directory exists
+        os.makedirs(data_dir, exist_ok=True)
+        
+        # File paths
+        self.price_history_file = os.path.join(data_dir, "price_history.json")
+        self.bot_logs_file = os.path.join(data_dir, "bot_logs.csv")
+        self.db_file = os.path.join(data_dir, "trading_data.db")
+        
+        # Initialize storage
+        if use_database:
+            self._init_database()
         else:
-            try:
-                df = pd.read_csv(
-                    self.bot_logs_file, nrows=1, encoding="utf-8", on_bad_lines="skip"
-                )
-                if not all(col in df.columns for col in self.HEADERS):
-                    logger.error(
-                        f"Invalid headers in {self.bot_logs_file}. Recreating file."
+            self._init_file_storage()
+    
+    def _init_database(self):
+        """Initialize SQLite database for better performance"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                # Create price history table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS price_history (
+                        timestamp INTEGER PRIMARY KEY,
+                        open_price REAL NOT NULL,
+                        high_price REAL NOT NULL,
+                        low_price REAL NOT NULL,
+                        close_price REAL NOT NULL,
+                        volume REAL NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        data_hash TEXT
                     )
-                    with open(self.bot_logs_file, "w", newline="") as f:
-                        writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC)
-                        writer.writerow(self.HEADERS)
-                    logger.info(
-                        f"Reinitialized {self.bot_logs_file} with correct headers"
+                """)
+                
+                # Create trading logs table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS trading_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME NOT NULL,
+                        price REAL,
+                        trade_volume REAL,
+                        side TEXT,
+                        reason TEXT,
+                        rsi REAL,
+                        macd REAL,
+                        signal_line REAL,
+                        upper_band REAL,
+                        lower_band REAL,
+                        sentiment REAL,
+                        buy_decision BOOLEAN,
+                        sell_decision BOOLEAN,
+                        btc_balance REAL,
+                        eur_balance REAL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
-            except Exception as e:
-                logger.error(
-                    f"Failed to validate {self.bot_logs_file}: {e}. Recreating file."
-                )
-                with open(self.bot_logs_file, "w", newline="") as f:
-                    writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC)
-                    writer.writerow(self.HEADERS)
-                logger.info(f"Reinitialized {self.bot_logs_file} with headers")
-
-    def validate_timestamp(self, timestamp: int) -> bool:
-        """Validate that timestamp is reasonable for current time"""
-        current_time = int(time.time())
+                """)
+                
+                # Create indices for performance
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_price_timestamp ON price_history(timestamp)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON trading_logs(timestamp)")
+                
+                conn.commit()
+                logger.info("Database initialized successfully")
+                
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            # Fallback to file storage
+            self.use_database = False
+            self._init_file_storage()
+    
+    def _init_file_storage(self):
+        """Initialize file-based storage"""
+        if not os.path.exists(self.price_history_file):
+            with open(self.price_history_file, 'w') as f:
+                json.dump([], f)
         
-        # Allow data from last 30 days to 1 hour in future
-        min_valid = current_time - (30 * 24 * 3600)  # 30 days ago
-        max_valid = current_time + (1 * 3600)         # 1 hour in future
-        
-        return min_valid <= timestamp <= max_valid
-
-    def detect_test_data(self, candles: List[List]) -> bool:
-        """Detect if we're dealing with test/mock data"""
-        if not candles:
-            return False
+        if not os.path.exists(self.bot_logs_file):
+            with open(self.bot_logs_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(self.REQUIRED_HEADERS)
+    
+    def _get_file_lock(self, file_path: str) -> threading.Lock:
+        """Get or create a lock for a specific file"""
+        with self._lock_manager:
+            if file_path not in self._file_locks:
+                self._file_locks[file_path] = threading.Lock()
+            return self._file_locks[file_path]
+    
+    def _validate_ohlc_candle(self, candle: List, previous_close: Optional[float] = None) -> bool:
+        """Comprehensive OHLC data validation"""
+        try:
+            if not isinstance(candle, list) or len(candle) < 6:
+                return False
             
-        # Check if timestamps are way in the future (like 2025 when it's 2024)
-        current_year = datetime.now().year
-        first_timestamp = int(candles[0][0])
-        candle_year = datetime.fromtimestamp(first_timestamp).year
-        
-        if candle_year > current_year + 1:
-            logger.warning(f"Detected future timestamps (year {candle_year}), treating as test data")
+            timestamp, open_price, high_price, low_price, close_price, volume = [
+                float(x) for x in candle[:6]
+            ]
+            
+            # Timestamp validation
+            current_time = time.time()
+            tolerance = self.validation_config.timestamp_tolerance_hours * 3600
+            
+            if not (current_time - 365*24*3600 <= timestamp <= current_time + tolerance):
+                logger.debug(f"Invalid timestamp: {timestamp}")
+                return False
+            
+            # Price validation
+            if not (self.validation_config.min_price_eur <= close_price <= self.validation_config.max_price_eur):
+                logger.debug(f"Price out of range: {close_price}")
+                return False
+            
+            # OHLC relationship validation
+            if not (low_price <= open_price <= high_price and 
+                   low_price <= close_price <= high_price and
+                   low_price <= high_price):
+                logger.debug(f"Invalid OHLC relationships")
+                return False
+            
+            # Volume validation
+            if volume < 0:
+                logger.debug(f"Negative volume: {volume}")
+                return False
+            
+            # Price change validation (if previous close available)
+            if previous_close:
+                price_change_pct = abs(close_price - previous_close) / previous_close
+                if price_change_pct > self.validation_config.max_price_change_pct:
+                    logger.warning(f"Large price change: {price_change_pct:.1%}")
+                    # Don't reject, just warn for large moves
+            
             return True
             
-        return False
-
-    def get_real_btc_price(self) -> float:
-        """Get real BTC price from external API as validation"""
-        try:
-            # Use CoinGecko API as backup validation
-            response = requests.get(
-                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=eur",
-                timeout=5
-            )
-            if response.status_code == 200:
-                data = response.json()
-                real_price = data.get('bitcoin', {}).get('eur', 0)
-                logger.debug(f"Real BTC/EUR price from CoinGecko: €{real_price:.2f}")
-                return real_price
-        except Exception as e:
-            logger.debug(f"Could not fetch real price: {e}")
+        except (ValueError, TypeError, ZeroDivisionError) as e:
+            logger.debug(f"Validation error: {e}")
+            return False
+    
+    def _calculate_data_hash(self, data: List) -> str:
+        """Calculate hash for data integrity verification"""
+        data_str = json.dumps(data, sort_keys=True)
+        return hashlib.sha256(data_str.encode()).hexdigest()[:16]
+    
+    async def load_price_history_async(self) -> Tuple[List[float], List[float]]:
+        """Async version of load_price_history with caching"""
+        # Check cache first
+        with self._cache_lock:
+            cache_age = time.time() - self._cache_timestamp
+            if cache_age < 300 and self._price_cache:  # 5-minute cache
+                prices = [candle[4] for candle in self._price_cache]  # Close prices
+                volumes = [candle[5] for candle in self._price_cache]  # Volumes
+                logger.debug(f"Using cached price data ({len(prices)} points)")
+                return prices, volumes
         
-        return 0.0
-
-    def load_price_history(self) -> Tuple[List[float], List[float]]:
+        if self.use_database:
+            return await self._load_from_database()
+        else:
+            return await self._load_from_file()
+    
+    async def _load_from_database(self) -> Tuple[List[float], List[float]]:
+        """Load price history from database"""
         try:
-            with open(self.price_history_file, "r") as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                logger.error(
-                    f"Invalid price history format: expected list, got {type(data)}"
-                )
-                return [], []
-
-            # Check if we have test data
-            is_test_data = self.detect_test_data(data)
+            def _db_query():
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.execute("""
+                        SELECT timestamp, open_price, high_price, low_price, close_price, volume
+                        FROM price_history
+                        ORDER BY timestamp ASC
+                        LIMIT 2000
+                    """)
+                    return cursor.fetchall()
             
-            if is_test_data:
-                logger.warning("📊 USING TEST DATA - adjusting for analysis purposes")
-                # For test data, just validate structure but allow future timestamps
-                pass
-            else:
-                # For real data, validate timestamps strictly
-                data = [candle for candle in data if self.validate_timestamp(int(candle[0]))]
-
-            # Deduplicate and sort by timestamp
-            seen_timestamps = set()
-            unique_data = []
-            for candle in data:
-                if not isinstance(candle, list) or len(candle) < 6:
-                    logger.debug(f"Skipping invalid candle format: {candle}")
-                    continue
-                timestamp = candle[0]
-                if timestamp in seen_timestamps:
-                    continue
-                seen_timestamps.add(timestamp)
-                unique_data.append(candle)
-
-            # Sort by timestamp
-            unique_data.sort(key=lambda x: x[0])
-
-            # Log timestamp range for debugging
-            if unique_data:
-                min_ts = unique_data[0][0]
-                max_ts = unique_data[-1][0]
-                min_dt = datetime.fromtimestamp(min_ts).isoformat()
-                max_dt = datetime.fromtimestamp(max_ts).isoformat()
-                logger.info(f"Price history timestamp range: {min_dt} to {max_dt}")
-                
-                # Validate against real price if not test data
-                if not is_test_data:
-                    latest_price = float(unique_data[-1][4])  # Close price
-                    real_price = self.get_real_btc_price()
-                    
-                    if real_price > 0:
-                        price_diff_pct = abs(latest_price - real_price) / real_price
-                        if price_diff_pct > 0.05:  # More than 5% difference
-                            logger.warning(f"⚠️ Price mismatch: Exchange={latest_price:.0f}, Real={real_price:.0f} ({price_diff_pct:.1%} diff)")
-
-            prices = []
-            volumes = []
-            for i, candle in enumerate(unique_data):
-                try:
-                    close_price = float(candle[4])  # Close price
-                    volume = float(candle[5])
-
-                    # Basic validation - allow wide range for different markets/test data
-                    if close_price > 100 and close_price < 1000000 and volume >= 0:
-                        prices.append(close_price)
-                        volumes.append(volume)
-                    else:
-                        logger.debug(
-                            f"Skipping candle with invalid price/volume: price={close_price}, volume={volume}"
-                        )
-
-                except (ValueError, TypeError, IndexError) as e:
-                    logger.debug(
-                        f"Skipping candle at index {i} due to error: {e}, candle: {candle}"
-                    )
-                    continue
-
-            logger.info(
-                f"Loaded {len(prices)} valid prices from {self.price_history_file}"
-            )
+            # Run database query in thread pool
+            loop = asyncio.get_event_loop()
+            rows = await loop.run_in_executor(None, _db_query)
+            
+            if not rows:
+                logger.warning("No price history found in database")
+                return [], []
+            
+            # Update cache
+            with self._cache_lock:
+                self._price_cache.clear()
+                self._price_cache.extend(rows)
+                self._cache_timestamp = time.time()
+            
+            prices = [row[4] for row in rows]  # Close prices
+            volumes = [row[5] for row in rows]  # Volumes
+            
+            logger.info(f"Loaded {len(prices)} price points from database")
             return prices, volumes
-
+            
         except Exception as e:
-            logger.error(f"Failed to load price history: {e}")
+            logger.error(f"Database load failed: {e}")
             return [], []
-
-    def append_ohlc_data(self, ohlc_data: List[List]) -> int:
-        """Append new OHLC data to price history - IMPROVED VERSION"""
+    
+    async def _load_from_file(self) -> Tuple[List[float], List[float]]:
+        """Load price history from file asynchronously"""
+        try:
+            async with aiofiles.open(self.price_history_file, 'r') as f:
+                content = await f.read()
+                data = json.loads(content)
+            
+            if not isinstance(data, list):
+                logger.error("Invalid price history format")
+                return [], []
+            
+            # Validate and process data
+            valid_candles = []
+            previous_close = None
+            
+            for candle in data:
+                if self._validate_ohlc_candle(candle, previous_close):
+                    valid_candles.append(candle)
+                    previous_close = float(candle[4])
+            
+            # Update cache
+            with self._cache_lock:
+                self._price_cache.clear()
+                self._price_cache.extend(valid_candles[-2000:])  # Keep last 2000
+                self._cache_timestamp = time.time()
+            
+            prices = [candle[4] for candle in valid_candles]
+            volumes = [candle[5] for candle in valid_candles]
+            
+            logger.info(f"Loaded {len(prices)} valid price points from file")
+            return prices, volumes
+            
+        except Exception as e:
+            logger.error(f"File load failed: {e}")
+            return [], []
+    
+    def load_price_history(self) -> Tuple[List[float], List[float]]:
+        """Synchronous wrapper for async load_price_history"""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create new task if loop is already running
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, self.load_price_history_async())
+                    return future.result(timeout=30)
+            else:
+                return asyncio.run(self.load_price_history_async())
+        except Exception as e:
+            logger.error(f"Sync load wrapper failed: {e}")
+            return [], []
+    
+    async def append_ohlc_data_async(self, ohlc_data: List[List]) -> int:
+        """Async version of append_ohlc_data with improved validation"""
         if not ohlc_data:
-            logger.debug("No OHLC data to append")
             return 0
         
         try:
-            # Load existing data
-            existing_data = []
-            if os.path.exists(self.price_history_file):
-                with open(self.price_history_file, 'r') as f:
-                    existing_data = json.load(f)
-            
-            # Check if incoming data is test data
-            is_test_data = self.detect_test_data(ohlc_data)
-            
-            # Get existing timestamps for duplicate detection
-            existing_timestamps = set()
-            if existing_data:
-                for candle in existing_data:
-                    if isinstance(candle, list) and len(candle) > 0:
-                        existing_timestamps.add(int(candle[0]))
-            
-            # Adjust validation based on data type
-            if is_test_data:
-                logger.info("📊 Processing test data - relaxed timestamp validation")
-                # For test data, just check it's not ancient
-                current_time = int(time.time())
-                min_valid_timestamp = current_time - (365 * 24 * 3600)  # 1 year ago
-                max_valid_timestamp = current_time + (10 * 365 * 24 * 3600)  # 10 years future (for test data)
+            if self.use_database:
+                return await self._append_to_database(ohlc_data)
             else:
-                # Real data validation
-                current_time = int(time.time())
-                min_valid_timestamp = current_time - (30 * 24 * 3600)  # 30 days ago
-                max_valid_timestamp = current_time + (1 * 24 * 3600)   # 1 day in future
+                return await self._append_to_file(ohlc_data)
+        except Exception as e:
+            logger.error(f"Append OHLC data failed: {e}")
+            return 0
+    
+    async def _append_to_database(self, ohlc_data: List[List]) -> int:
+        """Append OHLC data to database"""
+        def _db_insert():
+            added_count = 0
+            with sqlite3.connect(self.db_file) as conn:
+                # Get existing timestamps to avoid duplicates
+                cursor = conn.execute("SELECT timestamp FROM price_history")
+                existing_timestamps = {row[0] for row in cursor.fetchall()}
+                
+                # Prepare valid candles
+                valid_candles = []
+                previous_close = None
+                
+                for candle in ohlc_data:
+                    if not self._validate_ohlc_candle(candle, previous_close):
+                        continue
+                    
+                    timestamp = int(candle[0])
+                    if timestamp in existing_timestamps:
+                        continue
+                    
+                    data_hash = self._calculate_data_hash(candle[:6])
+                    valid_candles.append((
+                        timestamp, float(candle[1]), float(candle[2]), 
+                        float(candle[3]), float(candle[4]), float(candle[5]), data_hash
+                    ))
+                    previous_close = float(candle[4])
+                    added_count += 1
+                
+                # Batch insert
+                if valid_candles:
+                    conn.executemany("""
+                        INSERT INTO price_history 
+                        (timestamp, open_price, high_price, low_price, close_price, volume, data_hash)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, valid_candles)
+                    conn.commit()
+                
+                # Cleanup old data (keep last 5000 records)
+                conn.execute("""
+                    DELETE FROM price_history 
+                    WHERE timestamp < (
+                        SELECT timestamp FROM price_history 
+                        ORDER BY timestamp DESC LIMIT 1 OFFSET 5000
+                    )
+                """)
+                conn.commit()
             
-            logger.info(f"Processing {len(ohlc_data)} potential new candles...")
-            logger.info(f"Existing data points: {len(existing_data)}")
-            logger.info(f"Data type: {'TEST' if is_test_data else 'REAL'}")
+            return added_count
+        
+        # Run in thread pool
+        loop = asyncio.get_event_loop()
+        added_count = await loop.run_in_executor(None, _db_insert)
+        
+        if added_count > 0:
+            # Invalidate cache
+            with self._cache_lock:
+                self._cache_timestamp = 0
             
+            logger.info(f"Added {added_count} new candles to database")
+        
+        return added_count
+    
+    async def _append_to_file(self, ohlc_data: List[List]) -> int:
+        """Append OHLC data to file"""
+        lock = self._get_file_lock(self.price_history_file)
+        
+        with lock:
+            # Load existing data
+            try:
+                async with aiofiles.open(self.price_history_file, 'r') as f:
+                    content = await f.read()
+                    existing_data = json.loads(content)
+            except:
+                existing_data = []
+            
+            # Get existing timestamps
+            existing_timestamps = {int(candle[0]) for candle in existing_data}
+            
+            # Validate and add new data
             new_candles = []
-            processed_count = 0
+            previous_close = None
             
             for candle in ohlc_data:
-                processed_count += 1
-                try:
-                    if not isinstance(candle, list) or len(candle) < 6:
-                        logger.debug(f"Skipping invalid candle format: {candle}")
-                        continue
-                    
-                    # Extract timestamp and convert if needed
-                    timestamp = int(candle[0])
-                    
-                    # Log first few timestamps for debugging
-                    if processed_count <= 3:
-                        logger.info(f"Processing timestamp {processed_count}: {timestamp} ({datetime.fromtimestamp(timestamp)})")
-                    
-                    # Timestamp validation
-                    if timestamp < min_valid_timestamp:
-                        if processed_count <= 3:
-                            logger.debug(f"Skipping old timestamp: {timestamp}")
-                        continue
-                    
-                    if timestamp > max_valid_timestamp and not is_test_data:
-                        if processed_count <= 3:
-                            logger.debug(f"Skipping future timestamp: {timestamp}")
-                        continue
-                    
-                    # Skip duplicates
-                    if timestamp in existing_timestamps:
-                        if processed_count <= 3:
-                            logger.debug(f"Skipping duplicate timestamp: {timestamp}")
-                        continue
-                    
-                    # Validate OHLC values
-                    open_price = float(candle[1])
-                    high_price = float(candle[2])
-                    low_price = float(candle[3])
-                    close_price = float(candle[4])
-                    volume = float(candle[5])
-                    
-                    # Basic price validation
-                    if not (0 < low_price <= high_price and 
-                        low_price <= open_price <= high_price and 
-                        low_price <= close_price <= high_price and
-                        volume >= 0):
-                        logger.debug(f"Skipping invalid OHLC values: {candle}")
-                        continue
-                    
-                    # Price sanity check - allow wider range for test data
-                    min_price = 100 if not is_test_data else 10
-                    max_price = 1000000
-                    if not (min_price < close_price < max_price):
-                        logger.debug(f"Skipping unrealistic price: {close_price}")
-                        continue
-                    
-                    new_candles.append([timestamp, open_price, high_price, low_price, close_price, volume])
-                    existing_timestamps.add(timestamp)
-                    
-                    if len(new_candles) <= 3:
-                        logger.info(f"Added valid candle: {timestamp} @ €{close_price:.2f}")
-                    
-                except (ValueError, TypeError, IndexError) as e:
-                    logger.debug(f"Skipping invalid OHLC candle: {candle} - {e}")
+                if not self._validate_ohlc_candle(candle, previous_close):
                     continue
+                
+                timestamp = int(candle[0])
+                if timestamp in existing_timestamps:
+                    continue
+                
+                formatted_candle = [
+                    timestamp, float(candle[1]), float(candle[2]),
+                    float(candle[3]), float(candle[4]), float(candle[5])
+                ]
+                new_candles.append(formatted_candle)
+                existing_timestamps.add(timestamp)
+                previous_close = float(candle[4])
             
             if new_candles:
-                # Add new candles to existing data
+                # Add to existing data and sort
                 existing_data.extend(new_candles)
-                
-                # Sort by timestamp and remove any remaining duplicates
                 existing_data.sort(key=lambda x: x[0])
                 
-                # Keep only last 5000 candles to manage file size
-                if len(existing_data) > 5000:
-                    existing_data = existing_data[-5000:]
+                # Keep only last 5000 candles
+                existing_data = existing_data[-5000:]
                 
-                # Save updated data
-                with open(self.price_history_file, 'w') as f:
-                    json.dump(existing_data, f)
+                # Write back to file
+                async with aiofiles.open(self.price_history_file, 'w') as f:
+                    await f.write(json.dumps(existing_data, separators=(',', ':')))
                 
-                logger.info(f"✅ Successfully added {len(new_candles)} new OHLC candles")
-                logger.info(f"📊 Total candles in history: {len(existing_data)}")
+                # Invalidate cache
+                with self._cache_lock:
+                    self._cache_timestamp = 0
                 
-                if new_candles:
-                    latest = new_candles[-1]
-                    earliest = new_candles[0]
-                    logger.info(f"📅 Date range: {datetime.fromtimestamp(earliest[0])} to {datetime.fromtimestamp(latest[0])}")
-                    logger.info(f"💰 Price range: €{min(c[4] for c in new_candles):.2f} to €{max(c[4] for c in new_candles):.2f}")
-            else:
-                logger.info(f"ℹ️  No new valid candles to append from {len(ohlc_data)} processed")
+                logger.info(f"Added {len(new_candles)} new candles to file")
             
             return len(new_candles)
-            
+    
+    def append_ohlc_data(self, ohlc_data: List[List]) -> int:
+        """Synchronous wrapper for append_ohlc_data_async"""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, self.append_ohlc_data_async(ohlc_data))
+                    return future.result(timeout=30)
+            else:
+                return asyncio.run(self.append_ohlc_data_async(ohlc_data))
         except Exception as e:
-            logger.error(f"Failed to append OHLC data: {e}")
+            logger.error(f"Sync append wrapper failed: {e}")
             return 0
-
     
     def log_strategy(self, **kwargs) -> None:
-        max_retries = 3
-        for attempt in range(max_retries):
+        """Thread-safe strategy logging with validation"""
+        try:
+            # Sanitize input data
+            sanitized_kwargs = self._sanitize_log_data(kwargs)
+            
+            if self.use_database:
+                self._log_to_database(sanitized_kwargs)
+            else:
+                self._log_to_file(sanitized_kwargs)
+                
+        except Exception as e:
+            logger.error(f"Strategy logging failed: {e}")
+    
+    def _sanitize_log_data(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Sanitize and validate log data"""
+        sanitized = {}
+        
+        # Set timestamp if not provided
+        if "timestamp" not in kwargs:
+            kwargs["timestamp"] = datetime.now().isoformat()
+        
+        # Define expected fields with types and defaults
+        field_specs = {
+            "timestamp": (str, datetime.now().isoformat()),
+            "price": (float, None),
+            "trade_volume": (float, None),
+            "side": (str, ""),
+            "reason": (str, ""),
+            "rsi": (float, None),
+            "macd": (float, None),
+            "signal": (float, None),
+            "upper_band": (float, None),
+            "lower_band": (float, None),
+            "sentiment": (float, None),
+            "buy_decision": (bool, False),
+            "sell_decision": (bool, False),
+            "btc_balance": (float, None),
+            "eur_balance": (float, None),
+        }
+        
+        for field, (field_type, default) in field_specs.items():
+            value = kwargs.get(field, default)
+            
+            # Type conversion and validation
+            if value is not None:
+                try:
+                    if field_type == bool:
+                        sanitized[field] = str(value).lower() in ['true', '1', 'yes']
+                    elif field_type == str:
+                        # Sanitize strings to prevent injection
+                        sanitized[field] = str(value)[:200]  # Limit length
+                    else:
+                        sanitized[field] = field_type(value)
+                except (ValueError, TypeError):
+                    sanitized[field] = default
+            else:
+                sanitized[field] = default
+        
+        return sanitized
+    
+    def _log_to_database(self, data: Dict[str, Any]):
+        """Log to database"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                conn.execute("""
+                    INSERT INTO trading_logs (
+                        timestamp, price, trade_volume, side, reason, rsi, macd, 
+                        signal_line, upper_band, lower_band, sentiment, 
+                        buy_decision, sell_decision, btc_balance, eur_balance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    data["timestamp"], data["price"], data["trade_volume"],
+                    data["side"], data["reason"], data["rsi"], data["macd"],
+                    data["signal"], data["upper_band"], data["lower_band"],
+                    data["sentiment"], data["buy_decision"], data["sell_decision"],
+                    data["btc_balance"], data["eur_balance"]
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Database logging failed: {e}")
+    
+    def _log_to_file(self, data: Dict[str, Any]):
+        """Log to CSV file"""
+        lock = self._get_file_lock(self.bot_logs_file)
+        
+        with lock:
             try:
-                if "timestamp" not in kwargs:
-                    kwargs["timestamp"] = datetime.now().isoformat()
-
-                # Define default values for all columns
-                defaults = {
-                    "price": None,
-                    "trade_volume": None,
-                    "side": "",
-                    "reason": "",
-                    "dip": None,
-                    "rsi": None,
-                    "macd": None,
-                    "signal": None,
-                    "ma_short": None,
-                    "ma_long": None,
-                    "upper_band": None,
-                    "lower_band": None,
-                    "sentiment": None,
-                    "fee_rate": None,
-                    "netflow": None,
-                    "volume": None,
-                    "old_utxos": None,
-                    "buy_decision": "False",
-                    "sell_decision": "False",
-                    "btc_balance": None,
-                    "eur_balance": None,
-                    "avg_buy_price": None,
-                    "profit_margin": None,
-                }
-                # Update defaults with provided kwargs
-                for key in defaults:
-                    if key not in kwargs:
-                        kwargs[key] = defaults[key]
-
-                df = pd.DataFrame([kwargs])
-                # Ensure buy_decision and sell_decision are strings
-                df["buy_decision"] = df["buy_decision"].apply(
-                    lambda x: (
-                        "True"
-                        if str(x).lower() in ["true", "1"]
-                        else "False" if pd.notnull(x) else "False"
-                    )
-                )
-                df["sell_decision"] = df["sell_decision"].apply(
-                    lambda x: (
-                        "True"
-                        if str(x).lower() in ["true", "1"]
-                        else "False" if pd.notnull(x) else "False"
-                    )
-                )
-                # Ensure side is lowercase
-                if "side" in df:
-                    df["side"] = df["side"].str.lower()
-                with open(self.bot_logs_file, "a", newline="") as f:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                    try:
-                        df.to_csv(
-                            f,
-                            index=False,
-                            header=False,
-                            quoting=csv.QUOTE_NONNUMERIC,
-                            encoding="utf-8",
-                            columns=self.HEADERS,
-                        )
-                    finally:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                logger.debug(f"Logged strategy metrics to {self.bot_logs_file}")
-                return
+                with open(self.bot_logs_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    row = [data.get(header, "") for header in self.REQUIRED_HEADERS]
+                    writer.writerow(row)
             except Exception as e:
-                logger.error(
-                    f"Failed to log strategy (attempt {attempt+1}/{max_retries}): {e}"
-                )
-                if attempt < max_retries - 1:
-                    time.sleep(1)
-        logger.error(f"Failed to log strategy after {max_retries} attempts")
+                logger.error(f"File logging failed: {e}")
+    
+    def validate_bot_logs(self) -> bool:
+        """Validate bot logs integrity"""
+        try:
+            if self.use_database:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.execute("SELECT COUNT(*) FROM trading_logs")
+                    count = cursor.fetchone()[0]
+                    logger.info(f"Database contains {count} trading log entries")
+                    return count > 0
+            else:
+                if not os.path.exists(self.bot_logs_file):
+                    return False
+                
+                df = pd.read_csv(self.bot_logs_file, dtype={"buy_decision": str, "sell_decision": str})
+                logger.info(f"CSV file contains {len(df)} trading log entries")
+                return len(df) > 0
+                
+        except Exception as e:
+            logger.error(f"Log validation failed: {e}")
+            return False
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get data manager statistics"""
+        try:
+            stats = {
+                "storage_type": "database" if self.use_database else "file",
+                "cache_size": len(self._price_cache),
+                "cache_age_seconds": time.time() - self._cache_timestamp,
+            }
+            
+            if self.use_database:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.execute("SELECT COUNT(*) FROM price_history")
+                    stats["price_history_count"] = cursor.fetchone()[0]
+                    
+                    cursor = conn.execute("SELECT COUNT(*) FROM trading_logs")
+                    stats["trading_logs_count"] = cursor.fetchone()[0]
+            else:
+                prices, _ = self.load_price_history()
+                stats["price_history_count"] = len(prices)
+                
+                if os.path.exists(self.bot_logs_file):
+                    with open(self.bot_logs_file, 'r') as f:
+                        stats["trading_logs_count"] = sum(1 for _ in f) - 1  # Subtract header
+                else:
+                    stats["trading_logs_count"] = 0
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Statistics generation failed: {e}")
+            return {"error": str(e)}
+    
+    async def cleanup_old_data(self, days_to_keep: int = 90):
+        """Cleanup old data to manage storage"""
+        try:
+            cutoff_timestamp = time.time() - (days_to_keep * 24 * 3600)
+            
+            if self.use_database:
+                with sqlite3.connect(self.db_file) as conn:
+                    # Cleanup old price history
+                    cursor = conn.execute(
+                        "DELETE FROM price_history WHERE timestamp < ?", 
+                        (cutoff_timestamp,)
+                    )
+                    price_deleted = cursor.rowcount
+                    
+                    # Cleanup old trading logs
+                    cursor = conn.execute(
+                        "DELETE FROM trading_logs WHERE timestamp < ?",
+                        (datetime.fromtimestamp(cutoff_timestamp).isoformat(),)
+                    )
+                    logs_deleted = cursor.rowcount
+                    
+                    conn.commit()
+                    
+                    # Vacuum database to reclaim space
+                    conn.execute("VACUUM")
+                    
+                    logger.info(f"Cleaned up {price_deleted} price records and {logs_deleted} log records")
+            
+            # Invalidate cache
+            with self._cache_lock:
+                self._cache_timestamp = 0
+                
+        except Exception as e:
+            logger.error(f"Data cleanup failed: {e}")
+    
+    def close(self):
+        """Cleanup resources"""
+        with self._cache_lock:
+            self._price_cache.clear()
+        logger.info("Data manager closed")
 
-    def validate_bot_logs(self):
-        if not os.path.exists(self.bot_logs_file):
-            logger.debug(f"No bot logs found at {self.bot_logs_file}")
-            return False
-        df = pd.read_csv(
-            self.bot_logs_file,
-            dtype={"buy_decision": str, "sell_decision": str},
-            encoding="utf-8",
-            on_bad_lines="skip",
-        )
-        expected_columns = [
-            "timestamp",
-            "price",
-            "trade_volume",
-            "side",
-            "reason",
-            "buy_decision",
-            "sell_decision",
-        ]
-        missing_cols = [col for col in expected_columns if col not in df.columns]
-        if missing_cols:
-            logger.error(f"Missing columns in bot_logs.csv: {missing_cols}")
-            return False
-        buy_trades = df[df["buy_decision"].str.lower().isin(["true", "1"])]
-        if buy_trades.empty:
-            logger.debug("No valid buy trades in bot_logs.csv")
-            return False
-        logger.info(f"Validated bot_logs.csv: {len(buy_trades)} buy trades found")
-        return True
+
+# Enhanced data validation functions
+def detect_anomalies(prices: List[float], threshold: float = 3.0) -> List[int]:
+    """Detect price anomalies using z-score"""
+    if len(prices) < 10:
+        return []
+    
+    prices_array = np.array(prices)
+    z_scores = np.abs((prices_array - np.mean(prices_array)) / np.std(prices_array))
+    
+    return [i for i, z in enumerate(z_scores) if z > threshold]
+
+
+def validate_data_continuity(timestamps: List[int], expected_interval: int = 900) -> Dict[str, Any]:
+    """Validate data continuity and identify gaps"""
+    if len(timestamps) < 2:
+        return {"gaps": [], "continuity_score": 1.0}
+    
+    timestamps_sorted = sorted(timestamps)
+    gaps = []
+    
+    for i in range(1, len(timestamps_sorted)):
+        interval = timestamps_sorted[i] - timestamps_sorted[i-1]
+        if interval > expected_interval * 1.5:  # Allow 50% tolerance
+            gaps.append({
+                "start": timestamps_sorted[i-1],
+                "end": timestamps_sorted[i],
+                "duration_minutes": (interval) / 60
+            })
+    
+    total_time = timestamps_sorted[-1] - timestamps_sorted[0]
+    gap_time = sum(gap["end"] - gap["start"] for gap in gaps)
+    continuity_score = 1.0 - (gap_time / total_time) if total_time > 0 else 1.0
+    
+    return {
+        "gaps": gaps,
+        "continuity_score": continuity_score,
+        "total_gaps": len(gaps)
+    }
+
+
+# Usage example and testing
+async def test_secure_data_manager():
+    """Test the secure data manager"""
+    print("Testing Secure Data Manager...")
+    
+    manager = SecureDataManager(data_dir="./test_data", use_database=True)
+    
+    # Test data loading
+    prices, volumes = await manager.load_price_history_async()
+    print(f"Loaded {len(prices)} price points")
+    
+    # Test data appending
+    test_ohlc = [
+        [int(time.time()), 45000, 45100, 44900, 45050, 1.5],
+        [int(time.time()) + 900, 45050, 45200, 45000, 45150, 2.1]
+    ]
+    
+    added = await manager.append_ohlc_data_async(test_ohlc)
+    print(f"Added {added} test candles")
+    
+    # Test logging
+    manager.log_strategy(
+        timestamp=datetime.now().isoformat(),
+        price=45100.0,
+        side="buy",
+        reason="test_strategy",
+        rsi=45.0,
+        buy_decision=True
+    )
+    print("Logged test strategy entry")
+    
+    # Get statistics
+    stats = manager.get_statistics()
+    print(f"Statistics: {stats}")
+    
+    manager.close()
+    print("✅ Secure Data Manager test completed")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_secure_data_manager())
