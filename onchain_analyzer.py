@@ -43,8 +43,8 @@ class OnChainAnalyzer:
                 self.connect_rpc()
             self.rpc.getblockcount()
             return True
-        except:
-            logger.debug("RPC health check failed, reconnecting")
+        except Exception as e:
+            logger.debug(f"RPC health check failed, reconnecting: {e}")
             self.connect_rpc()
             return bool(self.rpc)
 
@@ -90,7 +90,8 @@ class OnChainAnalyzer:
             block_height = tx.get("blockheight", 0)
             current_height = self.rpc.getblockcount()
             return (current_height - block_height) * 10 / 1440 if block_height else None
-        except:
+        except Exception as e:
+            logger.debug(f"Failed to get UTXO age for {txid[:8]}: {e}")
             return None
 
     def get_onchain_signals(self) -> Dict[str, float]:
@@ -210,7 +211,8 @@ class OnChainAnalyzer:
                                         exchange = self.is_exchange_address(address)
                                         if exchange != "Unknown":
                                             netflow += amount
-                            except:
+                            except Exception as e:
+                                logger.debug(f"Error processing mempool tx: {e}")
                                 continue
                         
                         # Extrapolate mempool volume from sample

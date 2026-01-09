@@ -471,7 +471,72 @@ class TradingBot:
             return response.json().get('response', '').strip()
         except Exception as e:
             logger.error(f"Ollama call failed: {e}")
-            return '' 
+            return ''
+    
+    def _calculate_technical_indicators(self, prices: List[float], volumes: List[float]) -> Dict:
+        """Calculate all technical indicators from price/volume data."""
+        rsi = calculate_rsi(prices) or 0
+        macd, signal = calculate_macd(prices) or (0, 0)
+        upper_band, ma_short, lower_band = calculate_bollinger_bands(prices) or (0, 0, 0)
+        ma_long = calculate_moving_average(prices, 50) or 0
+        vwap = calculate_vwap(prices, volumes) or (prices[-1] if prices else 0)
+        volatility = self._calculate_volatility(prices)
+        market_trend = self._detect_market_regime(prices)
+        
+        return {
+            'rsi': rsi, 'macd': macd, 'signal': signal, 'ma_short': ma_short,
+            'ma_long': ma_long, 'vwap': vwap, 'volatility': volatility,
+            'market_trend': market_trend, 'upper_band': upper_band, 'lower_band': lower_band
+        }
+    
+    def _fetch_news_and_sentiment(self) -> tuple:
+        """Fetch news articles and calculate sentiment with error handling."""
+        try:
+            articles = fetch_enhanced_news(top_n=20)
+            news_analysis = calculate_enhanced_sentiment(articles)
+            sentiment = calculate_sentiment(articles)
+            return articles, news_analysis, sentiment
+        except Exception as e:
+            logger.warning(f"News fetching failed, using neutral sentiment: {e}")
+            return [], {"sentiment": 0.0, "risk_off_probability": 0.0, "macro_weight": 1.0}, 0.0
+    
+    def _get_balances_and_performance(self) -> tuple:
+        """Get current balances and performance metrics."""
+        btc_balance = self.trade_executor.get_total_btc_balance() or 0
+        eur_balance = self.trade_executor.get_available_balance("EUR") or 0
+        performance_report = self.performance_tracker.generate_performance_report()
+        avg_buy_price = self._estimate_avg_buy_price()
+        return btc_balance, eur_balance, performance_report, avg_buy_price
+    
+    def _build_indicators_dict(self, indicators: Dict, onchain: Dict, news: Dict,
+                               current_price: float, sentiment: float, market_trend: str,
+                               performance: Dict, avg_buy_price: float, price_history: List) -> Dict:
+        """Build comprehensive indicators dictionary from all data sources."""
+        dip_percentage = (indicators['ma_short'] - current_price) / indicators['ma_short'] if indicators['ma_short'] else 0
+        peak_price = max(price_history) if price_history else current_price
+        peak_dip_percentage = (peak_price - current_price) / peak_price if peak_price else 0
+        
+        return {
+            'current_price': current_price,
+            'news_analysis': news,
+            'rsi': indicators.get('rsi', 50),
+            'macd': indicators.get('macd', 0),
+            'signal': indicators.get('signal', 0),
+            'ma_short': indicators.get('ma_short', 0),
+            'ma_long': indicators.get('ma_long', 0),
+            'vwap': indicators.get('vwap', current_price),
+            'volatility': indicators.get('volatility', 0),
+            'sentiment': sentiment,
+            'market_trend': market_trend,
+            'fee_rate': onchain.get('fee_rate', 0),
+            'netflow': onchain.get('netflow', 0),
+            'onchain_volume': onchain.get('volume', 0),
+            'old_utxos': onchain.get('old_utxos', 0),
+            'dip_percentage': dip_percentage,
+            'peak_dip_percentage': peak_dip_percentage,
+            'performance_report': performance,
+            'avg_buy_price': avg_buy_price
+        }
     
     def execute_strategy(self):
         try:
@@ -499,93 +564,33 @@ class TradingBot:
                 return
 
             # Calculate basic technical indicators
-            rsi = calculate_rsi(prices) or 0
-            macd, signal = calculate_macd(prices) or (0, 0)
-            upper_band, ma_short, lower_band = calculate_bollinger_bands(prices) or (0, 0, 0)
-            ma_long = calculate_moving_average(prices, 50) or 0
-            vwap = calculate_vwap(prices, volumes) or current_price
-            volatility = self._calculate_volatility(prices)
-            market_trend = self._detect_market_regime(prices)
+            indicators = self._calculate_technical_indicators(prices, volumes)
+            rsi, macd, signal = indicators['rsi'], indicators['macd'], indicators['signal']
+            ma_short, ma_long = indicators['ma_short'], indicators['ma_long']
+            vwap = indicators['vwap']
+            volatility = indicators['volatility']
+            market_trend = indicators['market_trend']
 
             # Enhanced news analysis (with timeout and fallback)
-            try:
-                articles = fetch_enhanced_news(top_n=20)
-                news_analysis = calculate_enhanced_sentiment(articles)
-                sentiment = calculate_sentiment(articles)
-            except Exception as e:
-                logger.warning(f"News fetching failed, using neutral sentiment: {e}")
-                articles = []
-                news_analysis = {"sentiment": 0.0, "risk_off_probability": 0.0, "macro_weight": 1.0}
-                sentiment = 0.0
-
-            # Enhanced indicators with risk adjustment
-            try:
-                enhanced_indicators = calculate_risk_adjusted_indicators(prices, volumes, news_analysis)
-            except Exception as e:
-                logger.warning(f"Enhanced indicators failed, using basic ones: {e}")
-                enhanced_indicators = {
-                    'rsi': rsi,
-                    'macd': macd,
-                    'signal': signal,
-                    'ma_short': ma_short,
-                    'ma_long': ma_long,
-                    'vwap': vwap,
-                    'correlations': {},
-                    'liquidation_signals': {},
-                    'risk_factor': 1.0
-                }
+            articles, news_analysis, sentiment = self._fetch_news_and_sentiment()
 
             # Get on-chain signals
             onchain_signals = self.onchain_analyzer.get_onchain_signals()
-            fee_rate = onchain_signals.get("fee_rate", 0)
-            netflow = onchain_signals.get("netflow", 0)
-            onchain_volume = onchain_signals.get("volume", 0)
-            old_utxos = onchain_signals.get("old_utxos", 0)
-
-            # Calculate additional metrics
-            dip_percentage = (ma_short - current_price) / ma_short if ma_short else 0
-            peak_price = max(self.price_history) if self.price_history else current_price
-            peak_dip_percentage = (peak_price - current_price) / peak_price if peak_price else 0
 
             # Get balances and performance
-            btc_balance = self.trade_executor.get_total_btc_balance() or 0
-            eur_balance = self.trade_executor.get_available_balance("EUR") or 0
-
+            btc_balance, eur_balance, performance_report, avg_buy_price = self._get_balances_and_performance()
             self.performance_tracker.update_equity(btc_balance, eur_balance, current_price)
-            performance_report = self.performance_tracker.generate_performance_report()
-            avg_buy_price = self._estimate_avg_buy_price()
 
             # Combine all indicator data
-            indicators_data = {
-                'current_price': current_price,
-                'news_analysis': news_analysis,
-                'correlations': enhanced_indicators.get('correlations', {}),
-                'liquidation_signals': enhanced_indicators.get('liquidation_signals', {}),
-                'rsi': enhanced_indicators.get('rsi', rsi),
-                'adjusted_rsi_buy': enhanced_indicators.get('adjusted_rsi_buy', 30),
-                'adjusted_rsi_sell': enhanced_indicators.get('adjusted_rsi_sell', 70),
-                'macd': enhanced_indicators.get('macd', macd),
-                'signal': enhanced_indicators.get('signal', signal),
-                'ma_short': enhanced_indicators.get('ma_short', ma_short),
-                'ma_long': enhanced_indicators.get('ma_long', ma_long),
-                'vwap': enhanced_indicators.get('vwap', vwap),
-                'volatility': enhanced_indicators.get('risk_factor', 1) - 1,  # Convert risk factor to volatility
-                'sentiment': sentiment,
-                'fee_rate': fee_rate,
-                'netflow': netflow,
-                'onchain_volume': onchain_volume,
-                'old_utxos': old_utxos,
-                'market_trend': market_trend,
-                'dip_percentage': dip_percentage,
-                'peak_dip_percentage': peak_dip_percentage,
-                'performance_report': performance_report,
-                'avg_buy_price': avg_buy_price
-            }
+            indicators_data = self._build_indicators_dict(
+                indicators, onchain_signals, news_analysis, current_price, sentiment,
+                market_trend, performance_report, avg_buy_price, self.price_history
+            )
 
             logger.info(f"Indicators Data: Risk-off: {news_analysis.get('risk_off_probability', 0)*100:.0f}%, "
                         f"RSI: {indicators_data.get('rsi', 50):.1f}, "
                         f"Sentiment: {sentiment:.3f}, "
-                        f"Netflow: {netflow:.0f}")
+                        f"Netflow: {indicators_data.get('netflow', 0):.0f}")
 
             # Enhanced decision making with risk override
             action = self.enhanced_decide_action_with_risk_override(indicators_data)
@@ -696,24 +701,24 @@ class TradingBot:
                 "trade_volume": trade_volume,
                 "side": "buy" if buy_decision else "sell" if sell_decision else "",
                 "reason": reason,
-                "dip": dip_percentage,
-                "rsi": rsi,
-                "macd": macd,
-                "signal": signal,
-                "ma_short": ma_short,
-                "ma_long": ma_long,
-                "upper_band": upper_band,
-                "lower_band": lower_band,
-                "sentiment": sentiment,
-                "fee_rate": fee_rate,
-                "netflow": netflow,
-                "volume": onchain_volume,
-                "old_utxos": old_utxos,
+                "dip": indicators_data.get('dip_percentage', 0),
+                "rsi": indicators_data.get('rsi', 0),
+                "macd": indicators_data.get('macd', 0),
+                "signal": indicators_data.get('signal', 0),
+                "ma_short": indicators_data.get('ma_short', 0),
+                "ma_long": indicators_data.get('ma_long', 0),
+                "upper_band": indicators_data.get('vwap', 0),  # Using vwap as proxy for bands
+                "lower_band": indicators_data.get('vwap', 0),
+                "sentiment": indicators_data.get('sentiment', 0),
+                "fee_rate": indicators_data.get('fee_rate', 0),
+                "netflow": indicators_data.get('netflow', 0),
+                "volume": indicators_data.get('onchain_volume', 0),
+                "old_utxos": indicators_data.get('old_utxos', 0),
                 "buy_decision": buy_decision,
                 "sell_decision": sell_decision,
                 "btc_balance": btc_balance,
                 "eur_balance": eur_balance,
-                "avg_buy_price": avg_buy_price,
+                "avg_buy_price": indicators_data.get('avg_buy_price', 0),
                 "profit_margin": profit_margin
             }
             self.data_manager.log_strategy(**log_data)

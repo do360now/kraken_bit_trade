@@ -8,13 +8,16 @@ from logger_config import logger
 class PerformanceTracker:
     """Track and analyze trading bot performance"""
     
-    def __init__(self, initial_btc_balance: float = 0.0, initial_eur_balance: float = 0.0):
+    def __init__(self, initial_btc_balance: float = 0.0, initial_eur_balance: float = 0.0, 
+                 performance_file: str = None, load_history: bool = True):
         self.initial_btc_balance = initial_btc_balance
         self.initial_eur_balance = initial_eur_balance
         self.trades = []
         self.equity_curve = []
-        self.performance_file = "./performance_history.json"
-        self._load_performance_history()
+        self.performance_file = performance_file or "./performance_history.json"
+        if load_history:
+            self._load_performance_history()
+        
         
     
     def _load_performance_history(self):

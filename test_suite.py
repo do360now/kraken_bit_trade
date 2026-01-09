@@ -100,7 +100,8 @@ class TestPerformanceTracker(unittest.TestCase):
     
     def setUp(self):
         from performance_tracker import PerformanceTracker
-        self.tracker = PerformanceTracker()
+        # Create tracker without loading historical data for clean tests
+        self.tracker = PerformanceTracker(load_history=False)
     
     def test_win_rate_fifo_basic(self):
         """Test basic FIFO win rate calculation"""
