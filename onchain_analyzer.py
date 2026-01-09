@@ -50,15 +50,31 @@ class OnChainAnalyzer:
 
     def satoshis_to_btc(self, value):
         """
-        Convert a value (possibly in scientific notation or various types) to BTC float.
-        Handles strings like "0E-8" or "1e-8" natively via float conversion.
-        Ensures non-negative result and defaults to 0.0 on invalid inputs.
+        Convert satoshis to BTC.
+        
+        Bitcoin uses satoshis as the base unit where:
+        1 BTC = 100,000,000 satoshis
+        
+        Therefore: BTC = satoshis / 100,000,000
+        
+        Args:
+            value: Satoshi amount (int, float, or string)
+            
+        Returns:
+            float: BTC amount
+            
+        Examples:
+            100000000 satoshis → 1.0 BTC
+            50000000 satoshis → 0.5 BTC
+            1 satoshi → 0.00000001 BTC
         """
         if value is None or value == "":
             return 0.0
         try:
-            converted = float(value)
-            return max(converted, 0.0)
+            satoshis = float(value)
+            # CRITICAL: Convert satoshis to BTC by dividing by 100 million
+            btc = satoshis / 100_000_000.0
+            return max(btc, 0.0)
         except (ValueError, TypeError) as e:
             logger.debug(f"Invalid value for BTC conversion: {value} (type: {type(value)}), error: {e}")
             return 0.0
@@ -78,6 +94,10 @@ class OnChainAnalyzer:
             return None
 
     def get_onchain_signals(self) -> Dict[str, float]:
+        """
+        Fast on-chain analysis using getblockstats API (10-50x faster than full block parsing).
+        Only fetches individual transactions for exchange flow analysis.
+        """
         if not self.check_rpc_health():
             logger.warning("No node connection; using cached on-chain signals")
             return self.onchain_cache
@@ -89,7 +109,7 @@ class OnChainAnalyzer:
         retries = 3
         for attempt in range(retries):
             try:
-                # Mempool
+                # Mempool fee rate
                 if not self.mempool_cache or (current_time - self.mempool_cache_time) > 60:
                     mempool = self.rpc.getmempoolinfo()
                     fee_rate = float(mempool["total_fee"]) / mempool["size"] * 1e8 if mempool["size"] > 0 else 0
@@ -98,107 +118,122 @@ class OnChainAnalyzer:
                 else:
                     fee_rate = self.mempool_cache["fee_rate"]
 
-                # Blocks (reduce to 2 blocks for speed)
+                # Use fast getblockstats for volume metrics (analyze last 6 blocks = ~1 hour)
                 current_height = self.rpc.getblockcount()
-                netflow = 0
-                volume = 0
-                old_utxos = 0
-                tx_count = 0
-                vout_count = 0
-                error_count = 0
-                for height in range(max(current_height - 2, 0), current_height + 1):
-                    block_hash = self.rpc.getblockhash(height)
-                    if block_hash in self.block_cache:
-                        block = self.block_cache[block_hash]
+                total_volume = 0
+                
+                # Use getblockstats which is MUCH faster than fetching full blocks
+                for height in range(max(current_height - 5, 0), current_height + 1):
+                    stats_key = f"stats_{height}"
+                    if stats_key in self.block_cache:
+                        stats = self.block_cache[stats_key]
                     else:
-                        block = self.rpc.getblock(block_hash, 2)
-                        self.block_cache[block_hash] = block
-                        if len(self.block_cache) > 4:
-                            self.block_cache.pop(list(self.block_cache.keys())[0])
-                    block_error_count = 0
-                    block_volume = 0
-                    for tx in block["tx"]:
-                        if "coinbase" in [vin.get("coinbase", "") for vin in tx.get("vin", [])]:
-                            continue
-                        tx_count += 1
-                        tx_vouts = [vout for vout in tx["vout"] if vout.get("value") is not None and self.satoshis_to_btc(vout.get("value")) >= 0.000001]
-                        if not tx_vouts:
-                            if block_error_count < 5:
-                                logger.debug(f"Tx in block {height} has no valid vouts, skipping, txid: {tx.get('txid')[:8]}...")
-                            block_error_count += 1
-                            error_count += 1
-                            continue
-                        tx_value = sum(self.satoshis_to_btc(vout["value"]) for vout in tx_vouts)
-                        if tx_value == 0 and tx_vouts and block_error_count < 5:
-                            block_error_count += 1
-                            error_count += 1
-                            logger.debug(f"Tx in block {height} returned 0 value; sample vout: {tx_vouts[0].get('value')}, txid: {tx.get('txid')[:8]}...")
-                        block_volume += tx_value
-                        volume += tx_value
-                        vout_count += len(tx_vouts)
-                        for vout in tx_vouts:
-                            amount = self.satoshis_to_btc(vout["value"])
+                        # getblockstats returns aggregate data without fetching all transactions
+                        stats = self.rpc.getblockstats(height, ['total_out', 'txs'])
+                        self.block_cache[stats_key] = stats
+                        # Keep cache size manageable
+                        if len(self.block_cache) > 12:
+                            oldest_key = min(self.block_cache.keys())
+                            self.block_cache.pop(oldest_key)
+                    
+                    # total_out is in satoshis, convert to BTC
+                    block_volume = stats['total_out'] / 1e8
+                    total_volume += block_volume
+                    logger.debug(f"Block {height}: {block_volume:.2f} BTC volume, {stats['txs']} txs")
+
+                # For exchange netflow, sample recent blocks more efficiently
+                # Only fetch individual transactions for large volume monitoring
+                netflow = 0
+                old_utxos = 0
+                
+                # Sample only the most recent block for exchange flow (not all blocks)
+                recent_block_hash = self.rpc.getblockhash(current_height)
+                
+                # Use verbosity=1 to get only txids (much faster than verbosity=2)
+                if recent_block_hash not in self.block_cache:
+                    recent_block = self.rpc.getblock(recent_block_hash, 1)
+                    self.block_cache[recent_block_hash] = recent_block
+                else:
+                    recent_block = self.block_cache[recent_block_hash]
+                
+                # Sample only first 100 transactions for exchange flow analysis
+                tx_sample = recent_block.get("tx", [])[1:101]  # Skip coinbase, sample 100 txs
+                
+                for txid in tx_sample:
+                    try:
+                        tx = self.rpc.getrawtransaction(txid, True)
+                        
+                        # Only check outputs for exchange addresses
+                        for vout in tx.get("vout", []):
+                            amount = self.satoshis_to_btc(vout.get("value", 0))
                             if amount >= MIN_BTC:
-                                address = vout.get("scriptPubKey", {}).get("address", "N/A")
+                                address = vout.get("scriptPubKey", {}).get("address", "")
                                 exchange = self.is_exchange_address(address)
-                                netflow += amount if exchange != "Unknown" else -amount
+                                if exchange != "Unknown":
+                                    # Inflow to exchange (potential selling pressure)
+                                    netflow += amount
+                        
+                        # Check for old coin movements (only if netflow is significantly negative)
                         if netflow < -50:
-                            for vin in tx.get("vin", [])[:10]:
+                            for vin in tx.get("vin", [])[:5]:  # Check first 5 inputs only
                                 prev_txid = vin.get("txid")
                                 prev_vout = vin.get("vout")
                                 if prev_txid and prev_vout is not None:
                                     age = self.get_utxo_age(prev_txid, prev_vout)
                                     if age and age > 365:
                                         old_utxos += 1
-                    logger.debug(f"Block {height} volume: {block_volume:.2f} BTC")
-                    if block_error_count > 0:
-                        logger.debug(f"Block {height} had {block_error_count} txs with invalid vouts")
+                    except Exception as tx_error:
+                        logger.debug(f"Failed to process tx {txid[:8]}: {tx_error}")
+                        continue
 
-                # Mempool fallback if low volume
-                if volume < 5000:
-                    logger.debug("Low block volume; checking mempool")
-                    mempool_txs = self.rpc.getrawmempool(True)
-                    mempool_error_count = 0
-                    for txid in list(mempool_txs.keys())[:50]:  # Reduce to 50 txs for speed
-                        try:
-                            tx = self.rpc.getrawtransaction(txid, True)
-                            tx_vouts = [vout for vout in tx["vout"] if vout.get("value") is not None and self.satoshis_to_btc(vout.get("value")) >= 0.000001]
-                            if not tx_vouts:
-                                if mempool_error_count < 5:
-                                    logger.debug(f"Mempool tx {txid[:8]} has no valid vouts")
-                                mempool_error_count += 1
+                # Mempool sampling (only if volume is low)
+                if total_volume < 5000:
+                    logger.debug("Low block volume; sampling mempool")
+                    try:
+                        mempool_txs = self.rpc.getrawmempool(False)  # Just get txids (fast)
+                        
+                        # Sample only 30 random transactions from mempool
+                        import random
+                        sample_size = min(30, len(mempool_txs))
+                        sampled_txids = random.sample(list(mempool_txs), sample_size) if mempool_txs else []
+                        
+                        mempool_volume = 0
+                        for txid in sampled_txids:
+                            try:
+                                tx = self.rpc.getrawtransaction(txid, True)
+                                for vout in tx.get("vout", []):
+                                    amount = self.satoshis_to_btc(vout.get("value", 0))
+                                    mempool_volume += amount
+                                    
+                                    if amount >= MIN_BTC:
+                                        address = vout.get("scriptPubKey", {}).get("address", "")
+                                        exchange = self.is_exchange_address(address)
+                                        if exchange != "Unknown":
+                                            netflow += amount
+                            except:
                                 continue
-                            tx_value = sum(self.satoshis_to_btc(vout["value"]) for vout in tx_vouts)
-                            if tx_value == 0 and tx_vouts and mempool_error_count < 5:
-                                mempool_error_count += 1
-                                error_count += 1
-                                logger.debug(f"Mempool tx {txid[:8]} returned 0 value")
-                            volume += tx_value
-                            vout_count += len(tx_vouts)
-                            for vout in tx_vouts:
-                                amount = self.satoshis_to_btc(vout["value"])
-                                if amount >= MIN_BTC:
-                                    address = vout.get("scriptPubKey", {}).get("address", "N/A")
-                                    exchange = self.is_exchange_address(address)
-                                    netflow += amount if exchange != "Unknown" else -amount
-                        except:
-                            continue
-                    if mempool_error_count > 0:
-                        logger.debug(f"Mempool had {mempool_error_count} txs with invalid vouts")
-
-                if error_count > 0:
-                    logger.debug(f"Total {error_count} txs with invalid vouts across blocks and mempool")
+                        
+                        # Extrapolate mempool volume from sample
+                        if sampled_txids:
+                            total_mempool_txs = len(mempool_txs)
+                            estimated_mempool_volume = (mempool_volume / sample_size) * total_mempool_txs
+                            total_volume += estimated_mempool_volume
+                            logger.debug(f"Mempool: sampled {sample_size} txs, estimated {estimated_mempool_volume:.2f} BTC")
+                    except Exception as mempool_error:
+                        logger.debug(f"Mempool sampling failed: {mempool_error}")
 
                 signals = {
                     "fee_rate": fee_rate,
                     "netflow": netflow,
-                    "volume": volume,
+                    "volume": total_volume,
                     "old_utxos": old_utxos
                 }
                 self.onchain_cache = signals
                 self.onchain_cache_time = current_time
-                logger.debug(f"On-chain: Fee={fee_rate:.2f} sat/vB, Netflow={netflow:.2f} BTC, Volume={volume:.2f} BTC, Old_UTXOs={old_utxos}, Txs={tx_count}, Vouts={vout_count}")
+                logger.info(f"On-chain signals: Fee={fee_rate:.2f} sat/vB, Netflow={netflow:.2f} BTC, "
+                           f"Volume={total_volume:.2f} BTC, Old_UTXOs={old_utxos}")
                 return signals
+                
             except Exception as e:
                 logger.error(f"On-chain query failed (attempt {attempt + 1}/{retries}): {e}")
                 if attempt < retries - 1:

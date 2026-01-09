@@ -186,6 +186,8 @@ class TradingBot:
                 logger.error(f"Missing required columns in bot_logs.csv: {set(expected_columns) - set(df.columns)}")
                 return self._fallback_avg_buy_price()
             df['timestamp'] = df['timestamp'].astype(str)
+            df['side'] = df['side'].astype(str)
+            df['buy_decision'] = df['buy_decision'].astype(str)
             valid_rows = df[df['timestamp'].notna()]
             buy_trades = df[
                 (df["buy_decision"].str.lower().isin(["true", "1"])) & 
@@ -244,7 +246,7 @@ class TradingBot:
         total_return = performance.get('returns', {}).get('total', '0%')
         
         # Calculate profit/loss position
-        if avg_buy_price > 0:
+        if avg_buy_price and avg_buy_price > 0:
             profit_margin = (current_price - avg_buy_price) / avg_buy_price * 100
         else:
             profit_margin = 0
@@ -505,10 +507,16 @@ class TradingBot:
             volatility = self._calculate_volatility(prices)
             market_trend = self._detect_market_regime(prices)
 
-            # Enhanced news analysis
-            articles = fetch_enhanced_news(top_n=20)
-            news_analysis = calculate_enhanced_sentiment(articles)
-            sentiment = calculate_sentiment(articles)
+            # Enhanced news analysis (with timeout and fallback)
+            try:
+                articles = fetch_enhanced_news(top_n=20)
+                news_analysis = calculate_enhanced_sentiment(articles)
+                sentiment = calculate_sentiment(articles)
+            except Exception as e:
+                logger.warning(f"News fetching failed, using neutral sentiment: {e}")
+                articles = []
+                news_analysis = {"sentiment": 0.0, "risk_off_probability": 0.0, "macro_weight": 1.0}
+                sentiment = 0.0
 
             # Enhanced indicators with risk adjustment
             try:
@@ -784,7 +792,7 @@ class TradingBot:
         sentiment = indicators_data.get('sentiment', 0)
         current_price = indicators_data.get('current_price', 0)
         avg_buy_price = indicators_data.get('avg_buy_price', 0)
-        profit_margin = ((current_price - avg_buy_price) / avg_buy_price * 100) if avg_buy_price > 0 else 0
+        profit_margin = ((current_price - avg_buy_price) / avg_buy_price * 100) if avg_buy_price and avg_buy_price > 0 else 0
         
         risk_entry = {
             "timestamp": datetime.now().isoformat(),

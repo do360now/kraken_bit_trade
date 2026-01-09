@@ -147,19 +147,9 @@ class KrakenAPI:
         if result.get('error'):
             logger.error(f"Failed to fetch balance: {result['error']}")
             return None
-        
-        # Try multiple possible BTC asset keys (Kraken uses different keys)
-        possible_keys = ['XXBT', 'XBT', 'XBT.F', 'XBTC']
-        balance = 0.0
-        
-        for key in possible_keys:
-            if key in result.get('result', {}):
-                balance = float(result['result'][key])
-                logger.info(f"Total BTC balance ({key}): {balance}")
-                return balance
-        
-        logger.warning(f"BTC asset not found in balance. Available keys: {list(result.get('result', {}).keys())}")
-        return 0.0
+        balance = result.get('result', {}).get('XBT.F', 0)  # Use XBT.F for BTC balance
+        logger.info(f"Total BTC balance: {balance}")
+        return float(balance)
 
     def get_available_balance(self, asset: str) -> Optional[float]:
         result = self.query_private("Balance", {})

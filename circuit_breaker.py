@@ -56,10 +56,13 @@ class CircuitBreaker:
             self.state = CircuitState.OPEN
             logger.error(f"Circuit breaker OPENED for {func_name} after {self.failure_count} failures")
 
+_breakers = {}
+
 def circuit_breaker(failure_threshold: int = 5, recovery_timeout: int = 300):
-    """Decorator for circuit breaker functionality"""
     def decorator(func):
-        breaker = CircuitBreaker(failure_threshold, recovery_timeout)
+        if func.__name__ not in _breakers:
+            _breakers[func.__name__] = CircuitBreaker(failure_threshold, recovery_timeout)
+        breaker = _breakers[func.__name__]
         
         @wraps(func)
         def wrapper(*args, **kwargs):

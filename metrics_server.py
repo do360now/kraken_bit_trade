@@ -211,8 +211,7 @@ class MetricsServer:
         """
         Add this to your metrics server for web-based monitoring.
         """
-        f
-        
+                
         @self.metrics_server.app.route('/risk')
         def risk_dashboard():
             risk_summary = self.get_risk_summary()

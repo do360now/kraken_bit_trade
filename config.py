@@ -7,12 +7,12 @@ load_dotenv()
 
 
 # Get API credentials from environment variables
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+API_KEY = os.getenv("KRAKEN_API_KEY") or os.getenv("API_KEY")
+API_SECRET = os.getenv("KRAKEN_API_SECRET") or os.getenv("API_SECRET")
 
 # Ensure critical environment variables are set
 if not API_KEY or not API_SECRET:
-    raise ValueError("API_KEY or API_SECRET is missing. Please check your environment variables.")
+    raise ValueError("KRAKEN_API_KEY or KRAKEN_API_SECRET (or API_KEY/API_SECRET) is missing. Please check your .env file.")
 
 # API-related constants
 API_DOMAIN = os.getenv("API_DOMAIN", "https://api.kraken.com")
@@ -20,9 +20,9 @@ API_DOMAIN = os.getenv("API_DOMAIN", "https://api.kraken.com")
 
 # Allocation strategy for portfolio management
 ALLOCATIONS = {
-    'HODL': float(os.getenv("ALLOC_HODL")),
-    'YIELD': float(os.getenv("ALLOC_YIELD")),
-    'TRADING': float(os.getenv("ALLOC_TRADING")),
+    'HODL': float(os.getenv("ALLOC_HODL", "0.9")),
+    'YIELD': float(os.getenv("ALLOC_YIELD", "0.0")),
+    'TRADING': float(os.getenv("ALLOC_TRADING", "0.1")),
 }
 
 
