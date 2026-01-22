@@ -4,12 +4,14 @@ Performance benchmark for onchain_analyzer.py optimization (Issue #10)
 Compares execution time and validates output
 """
 
+import os
 import sys
 import time
 from unittest.mock import Mock, MagicMock, patch
 
 # Add current directory to path
-sys.path.insert(0, '/home/claude')
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from onchain_analyzer import OnChainAnalyzer
 
@@ -99,7 +101,7 @@ def test_performance_improvement():
         assert avg_time < 1.0, f"Too slow! Avg: {avg_time:.3f}s"
         
         print("\n✅ PASS: Performance is within acceptable range")
-        return signals
+        assert signals is not None
 
 def test_signal_accuracy():
     """Test that signals are still accurate after optimization"""

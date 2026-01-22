@@ -21,7 +21,7 @@ class TradeExecutor:
         return None, 0.0
 
     def get_btc_order_book(self) -> Optional[Dict]:
-        return self.kraken_api.get_btc_order_book()
+        return self.kraken_api.get_order_book()
 
     def get_optimal_price(self, order_book: Dict, side: str) -> Optional[float]:
         optimal_price = self.kraken_api.get_optimal_price(order_book, side)

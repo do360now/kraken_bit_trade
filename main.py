@@ -11,6 +11,8 @@ from config import API_KEY, API_SECRET, API_DOMAIN, PRICE_HISTORY_FILE, BOT_LOGS
 from logger_config import logger
 from order_manager import OrderManager
 
+
+
 def main():
     logger.info("Starting Bitcoin accumulation bot...")
 

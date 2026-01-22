@@ -224,7 +224,8 @@ class TradingBot:
 
     def enhanced_decide_action_with_risk_override(self, indicators_data: Dict) -> str:
         """
-        Advanced decision making with comprehensive risk management.
+        IMPROVED: Bitcoin accumulation strategy with strict sell protection.
+        Only sells when TRULY necessary or at significant profit.
         """
         # Extract all key indicators
         news_analysis = indicators_data.get('news_analysis', {})
@@ -239,11 +240,11 @@ class TradingBot:
         signal = indicators_data.get('signal', 0)
         vwap = indicators_data.get('vwap', current_price)
         volatility = indicators_data.get('volatility', 0)
+        ma_long = indicators_data.get('ma_long', current_price)
         
         # Performance metrics
         performance = indicators_data.get('performance_report', {})
         win_rate = float(performance.get('risk_metrics', {}).get('win_rate', '0%').rstrip('%')) / 100
-        total_return = performance.get('returns', {}).get('total', '0%')
         
         # Calculate profit/loss position
         if avg_buy_price and avg_buy_price > 0:
@@ -251,157 +252,165 @@ class TradingBot:
         else:
             profit_margin = 0
         
-        # Calculate position relative to VWAP
+        # Calculate position relative to VWAP and long-term MA
         vwap_distance = (current_price - vwap) / vwap * 100
+        ma_distance = (current_price - ma_long) / ma_long * 100 if ma_long > 0 else 0
+        
+        # BULL MARKET DETECTION (crucial for accumulation strategy)
+        is_bull_market = (
+            ma_distance > 5 or  # Price 5%+ above 50-day MA
+            market_trend == "strong_uptrend"
+        )
         
         logger.info(f"🔍 ANALYSIS - Price: €{current_price:.0f}, P&L: {profit_margin:.1f}%, "
-                    f"Risk-off: {risk_off_prob*100:.0f}%, Sentiment: {sentiment:.3f}, "
-                    f"RSI: {rsi:.1f}, VWAP: {vwap_distance:+.1f}%")
+                    f"Bull Market: {is_bull_market}, MA Distance: {ma_distance:+.1f}%, "
+                    f"Risk-off: {risk_off_prob*100:.0f}%, RSI: {rsi:.1f}")
         
-        # EMERGENCY CONDITIONS - Override everything else
+        # =============================================================================
+        # EMERGENCY CONDITIONS ONLY - Very high bar for selling
+        # =============================================================================
         
-        # 1. EXTREME RISK CONDITIONS
-        if risk_off_prob > 0.8:  # 80%+ risk-off probability
-            logger.error(f"🚨 EXTREME RISK: Risk-off {risk_off_prob*100:.0f}% - EMERGENCY SELL")
+        # 1. EXTREME SYSTEMIC RISK (nearly certain crash)
+        if risk_off_prob > 0.9 and sentiment < -0.3:  # Raised threshold to 90%
+            logger.error(f"🚨 EXTREME SYSTEMIC RISK: Risk-off {risk_off_prob*100:.0f}% - EMERGENCY SELL")
             return 'sell'
         
-        # 2. LIQUIDATION CASCADE WARNING
-        if volatility > 0.08 and sentiment < -0.1 and current_price < vwap * 0.95:
-            logger.error(f"🚨 LIQUIDATION CASCADE: High vol + negative sentiment + below VWAP - SELL")
+        # 2. CONFIRMED LIQUIDATION CASCADE (rare)
+        liquidation_cascade = (
+            volatility > 0.12 and  # Very high volatility
+            sentiment < -0.2 and
+            current_price < vwap * 0.92 and  # 8%+ below VWAP
+            rsi < 25  # Extremely oversold = panic
+        )
+        if liquidation_cascade:
+            logger.error(f"🚨 LIQUIDATION CASCADE DETECTED - EMERGENCY SELL")
             return 'sell'
         
-        # HIGH RISK CONDITIONS - Very conservative approach
+        # =============================================================================
+        # HIGH PROFIT CONDITIONS - Take significant profits
+        # =============================================================================
         
-        # 3. HIGH MACRO RISK
-        if risk_off_prob > 0.6:  # 60%+ risk-off probability
-            if profit_margin > 2:  # If profitable, take some profits
-                logger.warning(f"⚠️ HIGH MACRO RISK: Risk-off {risk_off_prob*100:.0f}% + profitable - SELL")
+        # 3. MAJOR PROFIT TARGET (25%+ gains)
+        if profit_margin > 25:
+            # Even in bull markets, 25% is worth taking SOME profit
+            logger.info(f"💰💰 MAJOR PROFITS: {profit_margin:.1f}% - PARTIAL PROFIT TAKING")
+            return 'sell'
+        
+        # 4. STRONG PROFIT + EXTREME OVERBOUGHT (15%+ gains)
+        if profit_margin > 15 and rsi > 80:
+            # Price is extremely overbought AND we have good profits
+            logger.info(f"💰 STRONG PROFITS + EXTREME OVERBOUGHT: {profit_margin:.1f}% - TAKE PROFITS")
+            return 'sell'
+        
+        # 5. GOOD PROFIT + BEARISH SIGNALS (in non-bull markets)
+        if not is_bull_market:  # DON'T sell in bull markets unless extreme
+            if profit_margin > 12 and rsi > 75:
+                logger.info(f"💰 GOOD PROFITS + OVERBOUGHT (no bull trend): {profit_margin:.1f}% - TAKE PROFITS")
                 return 'sell'
-            else:
-                logger.warning(f"⚠️ HIGH MACRO RISK: Risk-off {risk_off_prob*100:.0f}% - NO NEW POSITIONS")
-                return 'hold'
         
-        # 4. STRONG DOWNTREND + UNDERWATER
-        if market_trend == 'strong_downtrend' and profit_margin < -2:
-            if rsi > 60:  # Overbought in downtrend = bad
-                logger.warning(f"📉 DOWNTREND + UNDERWATER + OVERBOUGHT - SELL")
-                return 'sell'
-            else:
-                logger.warning(f"📉 STRONG DOWNTREND + UNDERWATER - HOLD")
-                return 'hold'
+        # =============================================================================
+        # RISK MANAGEMENT - Be more cautious with high risk
+        # =============================================================================
         
-        # 5. POOR PERFORMANCE ADJUSTMENT
-        if win_rate < 0.3 and total_return.startswith('-'):  # Win rate < 30% and negative returns
-            # Be more conservative
-            if risk_off_prob > 0.4:  # Lower threshold when performing poorly
-                logger.warning(f"📊 POOR PERFORMANCE: Win rate {win_rate*100:.0f}% - DEFENSIVE MODE")
-                return 'hold'
+        # 6. VERY HIGH RISK + ALREADY PROFITABLE
+        if risk_off_prob > 0.7 and profit_margin > 8:
+            # Only sell if we have SOME profit and risk is VERY high
+            logger.warning(f"⚠️ VERY HIGH RISK: {risk_off_prob*100:.0f}% + profitable - DEFENSIVE SELL")
+            return 'sell'
         
-        # MODERATE RISK CONDITIONS
-        
-        # 6. MODERATE RISK - SELECTIVE TRADING
-        if risk_off_prob > 0.4:  # 40-60% risk-off probability
-            # Only trade in very favorable conditions
-            strong_buy_signals = sum([
-                rsi < 35,  # Very oversold
-                current_price < vwap * 0.98,  # Significantly below VWAP
-                netflow < -10000,  # Very strong accumulation
-                sentiment > 0.05,  # Positive sentiment despite risk
-                macd > signal,  # MACD bullish crossover
-            ])
-            
-            if strong_buy_signals >= 4:  # Need 4/5 strong signals
-                logger.info(f"⚡ MODERATE RISK BUT STRONG SIGNALS ({strong_buy_signals}/5) - BUY")
-                return 'buy'
-            
-            # Check for profit taking
-            if profit_margin > 5:
-                logger.info(f"💰 MODERATE RISK + PROFITABLE ({profit_margin:.1f}%) - TAKE PROFITS")
-                return 'sell'
-            
-            logger.info(f"⚠️ MODERATE RISK: Only {strong_buy_signals}/5 strong signals - HOLD")
+        # 7. HIGH RISK - NO NEW POSITIONS (but don't sell existing)
+        if risk_off_prob > 0.6:
+            logger.warning(f"⚠️ HIGH RISK: {risk_off_prob*100:.0f}% - NO NEW POSITIONS")
             return 'hold'
         
-        # LOW RISK CONDITIONS - Normal trading
+        # =============================================================================
+        # BUY CONDITIONS - Aggressive accumulation in dips
+        # =============================================================================
         
-        # 7. PROFIT TAKING RULES
-        if profit_margin > 8:  # 8%+ profit
-            logger.info(f"💰 STRONG PROFITS: {profit_margin:.1f}% - TAKE PROFITS")
-            return 'sell'
-        elif profit_margin > 5 and (rsi > 70 or current_price > vwap * 1.02):
-            logger.info(f"💰 GOOD PROFITS + OVERBOUGHT: {profit_margin:.1f}% - TAKE PROFITS")
-            return 'sell'
-        
-        # 8. BUY CONDITIONS (Low risk environment)
+        # 8. STRONG BUY SIGNALS (multiple confirmations needed)
         buy_signals = [
-            rsi < 45,  # Oversold or neutral
-            current_price < vwap,  # Below VWAP
-            netflow < -3000,  # Accumulation happening
-            sentiment > -0.05,  # Not too negative
-            macd > signal or abs(macd - signal) < 5,  # MACD neutral or bullish
+            rsi < 45,
+            current_price < vwap * 0.98,  # Below VWAP
+            netflow < -3000,  # Exchange outflow = accumulation
+            sentiment > -0.1,  # Not extremely negative
+            macd > signal or abs(macd - signal) < 5,
         ]
         
         buy_score = sum(buy_signals)
         
-        # Additional boost for very oversold conditions
-        if rsi < 30:
+        # Bonus signals for aggressive buying
+        if rsi < 30:  # Very oversold
             buy_score += 1
             logger.info(f"🔥 VERY OVERSOLD BOOST: RSI {rsi:.1f}")
         
-        # Additional boost for strong accumulation
-        if netflow < -8000:
+        if netflow < -8000:  # Strong accumulation
             buy_score += 1
             logger.info(f"🐋 STRONG ACCUMULATION BOOST: Netflow {netflow:.0f}")
         
-        logger.info(f"📊 BUY SIGNALS: {buy_score}/5 base + bonuses")
+        # LOWER threshold in bull markets (accumulate more aggressively)
+        required_buy_signals = 3 if is_bull_market else 4
         
-        if buy_score >= 4:  # Need 4+ signals for buy
-            logger.info(f"✅ BUY CONDITIONS MET: {buy_score} signals")
+        if buy_score >= required_buy_signals:
+            logger.info(f"✅ BUY CONDITIONS MET: {buy_score}/{required_buy_signals} signals")
             return 'buy'
         
-        # 9. SELL CONDITIONS (Technical)
+        # =============================================================================
+        # TECHNICAL SELL CONDITIONS - Very strict
+        # =============================================================================
+        
+        # 9. TECHNICAL SELL (need extreme conditions AND profitability)
         sell_signals = [
-            rsi > 75,  # Very overbought
-            current_price > vwap * 1.05,  # 5% above VWAP
+            rsi > 80,  # VERY overbought (not just 75)
+            current_price > vwap * 1.08,  # 8% above VWAP (not just 5%)
             market_trend == 'strong_downtrend',
-            sentiment < -0.1,  # Very negative sentiment
-            macd < signal and signal > 0,  # Bearish MACD crossover
+            sentiment < -0.15,  # Very negative
+            macd < signal - 10,  # Strong bearish divergence
         ]
         
         sell_score = sum(sell_signals)
         
-        if sell_score >= 3 and profit_margin > 0:  # Need 3+ signals and be profitable
+        # Need MORE signals AND decent profit AND not in bull market
+        if sell_score >= 4 and profit_margin > 5 and not is_bull_market:
             logger.info(f"📉 TECHNICAL SELL: {sell_score}/5 signals + profitable")
             return 'sell'
         
-        # 10. DEFAULT HOLD WITH REASONING
-        hold_reasons = []
-        if buy_score < 4:
-            hold_reasons.append(f"insufficient buy signals ({buy_score}/4)")
-        if risk_off_prob > 0.3:
-            hold_reasons.append(f"elevated risk ({risk_off_prob*100:.0f}%)")
-        if profit_margin < 0 and sell_score < 3:
-            hold_reasons.append("underwater position, waiting for recovery")
+        # =============================================================================
+        # DEFAULT: HOLD (accumulation bias)
+        # =============================================================================
         
-        logger.info(f"⏸️ HOLD: {', '.join(hold_reasons) if hold_reasons else 'market conditions neutral'}")
+        hold_reasons = []
+        if buy_score < required_buy_signals:
+            hold_reasons.append(f"insufficient buy signals ({buy_score}/{required_buy_signals})")
+        if profit_margin < 12:
+            hold_reasons.append(f"profits below threshold ({profit_margin:.1f}% < 12%)")
+        if is_bull_market:
+            hold_reasons.append("in bull market - accumulating")
+        
+        logger.info(f"⏸️ HOLD: {', '.join(hold_reasons) if hold_reasons else 'market neutral'}")
         return 'hold'
 
-    def calculate_risk_adjusted_position_size(self, action: str, indicators_data: Dict, 
-                                            btc_balance: float, eur_balance: float) -> float:
+    def calculate_risk_adjusted_position_size(self, action: str, indicators_data: Dict, btc_balance: float, eur_balance: float) -> float:
         """
-        Calculate position size based on comprehensive risk assessment.
+        IMPROVED: Much more conservative position sizing for Bitcoin accumulation.
+        
+        Key changes:
+        - SELL: Max 25% per trade (not 80%!)
+        - BUY: Larger positions in dips
+        - Risk adjustment more conservative
         """
         if action == 'hold':
             return 0.0
         
-        # Base position sizes
-        base_buy_pct = 0.08  # 8% of EUR balance
-        base_sell_pct = 0.12  # 12% of BTC balance
+        # BASE POSITION SIZES (more conservative for sells)
+        base_buy_pct = 0.10  # 10% of EUR balance (slightly more aggressive for accumulation)
+        base_sell_pct = 0.08  # 8% of BTC balance (much less than current 12%)
         
         # Risk adjustments
         news_analysis = indicators_data.get('news_analysis', {})
         risk_off_prob = news_analysis.get('risk_off_probability', 0)
         volatility = indicators_data.get('volatility', 0.02)
+        profit_margin = ((indicators_data.get('current_price', 0) - indicators_data.get('avg_buy_price', 1)) 
+                        / indicators_data.get('avg_buy_price', 1) * 100)
         
         # Performance adjustment
         performance = indicators_data.get('performance_report', {})
@@ -410,40 +419,55 @@ class TradingBot:
         # Calculate risk multiplier
         risk_multiplier = 1.0
         
-        # Reduce size for high risk-off probability
-        if risk_off_prob > 0.4:
-            risk_multiplier *= (1 - risk_off_prob)  # Scale down proportionally
+        # Reduce size for high risk
+        if risk_off_prob > 0.5:
+            risk_multiplier *= (1 - risk_off_prob * 0.8)  # More conservative
         
         # Reduce size for high volatility
-        if volatility > 0.05:
-            risk_multiplier *= 0.7
-        
-        # Reduce size for poor performance
-        if win_rate < 0.3:
+        if volatility > 0.06:
             risk_multiplier *= 0.6
         
-        # Increase size for very favorable conditions
-        rsi = indicators_data.get('rsi', 50)
-        netflow = indicators_data.get('netflow', 0)
+        # Reduce size for poor performance
+        if win_rate < 0.35:
+            risk_multiplier *= 0.7
         
-        if action == 'buy' and rsi < 30 and netflow < -8000 and risk_off_prob < 0.2:
-            risk_multiplier *= 1.5  # Aggressive buying in very favorable conditions
-        
-        # Calculate final position
+        # BUYING: Aggressive in good conditions
         if action == 'buy':
+            rsi = indicators_data.get('rsi', 50)
+            netflow = indicators_data.get('netflow', 0)
+            
+            # Increase buy size in great conditions
+            if rsi < 30 and netflow < -8000 and risk_off_prob < 0.2:
+                risk_multiplier *= 1.8  # Very aggressive in extreme dips
+            elif rsi < 35 and netflow < -5000:
+                risk_multiplier *= 1.4  # Aggressive in dips
+            
             position_eur = eur_balance * base_buy_pct * risk_multiplier
             current_price = indicators_data.get('current_price', 1)
             position_btc = position_eur / current_price
             
-            # Ensure we have enough EUR and respect minimums
+            # Ensure we have enough EUR
             max_affordable = eur_balance * 0.9 / current_price
             position_btc = min(position_btc, max_affordable)
             position_btc = max(position_btc, self.min_trade_volume)
-            
+        
+        # SELLING: Very conservative
         elif action == 'sell':
             position_btc = btc_balance * base_sell_pct * risk_multiplier
-            position_btc = min(position_btc, btc_balance * 0.8)  # Max 80% of holdings
+            
+            # CRITICAL: Hard cap at 25% of holdings (NEVER sell 80%)
+            max_sell_btc = btc_balance * 0.25
+            position_btc = min(position_btc, max_sell_btc)
+            
+            # Scale up slightly if massive profits
+            if profit_margin > 30:
+                position_btc = min(position_btc * 1.5, max_sell_btc)
+            
+            # Ensure minimum trade size
             position_btc = max(position_btc, self.min_trade_volume)
+            
+            logger.info(f"🛡️ SELL SIZE PROTECTION: Selling max {position_btc:.8f} BTC "
+                    f"({position_btc/btc_balance*100:.1f}% of holdings)")
         
         else:
             position_btc = 0.0

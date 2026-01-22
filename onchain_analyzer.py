@@ -1,6 +1,7 @@
 # onchain_analyzer.py
 import time
 from typing import Dict
+from free_exchange_flow_tracker import FreeExchangeFlowTracker
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 from config import (
     RPC_HOST, RPC_PORT, RPC_USER, RPC_PASSWORD,
@@ -18,6 +19,7 @@ class OnChainAnalyzer:
         self.block_cache = {}
         self.mempool_cache = None
         self.mempool_cache_time = 0
+        self.exchange_tracker = FreeExchangeFlowTracker()
 
     def connect_rpc(self):
         max_attempts = 5
@@ -99,6 +101,8 @@ class OnChainAnalyzer:
         Fast on-chain analysis using getblockstats API (10-50x faster than full block parsing).
         Only fetches individual transactions for exchange flow analysis.
         """
+       
+
         if not self.check_rpc_health():
             logger.warning("No node connection; using cached on-chain signals")
             return self.onchain_cache
@@ -144,7 +148,9 @@ class OnChainAnalyzer:
 
                 # For exchange netflow, sample recent blocks more efficiently
                 # Only fetch individual transactions for large volume monitoring
-                netflow = 0
+                netflow = self.exchange_tracker.get_exchange_netflow_estimate()
+                if netflow is None:
+                    netflow = 0.0
                 old_utxos = 0
                 
                 # Sample only the most recent block for exchange flow (not all blocks)
