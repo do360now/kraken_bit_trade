@@ -146,6 +146,15 @@ class KrakenAPI:
         """
         error_str = ', '.join(error_list)
         
+        # Nonce errors - force re-sync and retry (usually indicates clock skew)
+        if 'Invalid nonce' in error_str or 'EAPI:Invalid nonce' in error_str:
+            logger.warning(
+                f"Kraken API nonce error on {endpoint} - forcing server time re-sync",
+                error=error_str
+            )
+            self._sync_server_time()  # Force immediate re-sync
+            raise RetryableAPIError(f"Kraken API nonce error (retryable): {error_str}")
+        
         # Retryable errors
         retryable_patterns = [
             'Rate limit exceeded',
@@ -212,7 +221,8 @@ class KrakenAPI:
             self._rate_limit()
             
             # Periodically re-sync server time to prevent nonce errors
-            if time.time() - self._last_time_sync > 3600:  # Sync every hour
+            # Sync more frequently (every 2 minutes instead of 5) to catch clock drift early
+            if time.time() - self._last_time_sync > 120:
                 self._sync_server_time()
             
             # Use server-synchronized time for nonce (fixes "EAPI:Invalid nonce" errors)

@@ -100,42 +100,67 @@ class DataManager:
             return [], []
 
     def append_ohlc_data(self, ohlc: List[List]) -> None:
-        try:
-            # Load existing data
-            with open(self.price_history_file, 'r') as f:
-                existing_data = json.load(f)
-            if not isinstance(existing_data, list):
-                logger.warning(f"Resetting invalid price history format: {type(existing_data)}")
-                existing_data = []
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Load existing data with file locking to prevent concurrent corruption
+                with open(self.price_history_file, 'r') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    try:
+                        existing_data = json.load(f)
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                
+                if not isinstance(existing_data, list):
+                    logger.warning(f"Resetting invalid price history format: {type(existing_data)}")
+                    existing_data = []
 
-            # Deduplicate existing data
-            seen_timestamps = {candle[0] for candle in existing_data if isinstance(candle, list) and len(candle) >= 7}
-            valid_ohlc = []
-            for candle in ohlc:
-                if not isinstance(candle, list) or len(candle) < 7:
-                    logger.debug(f"Skipping invalid OHLC candle: {candle}")
-                    continue
-                try:
-                    timestamp = float(candle[0])
-                    if timestamp in seen_timestamps:
-                        logger.debug(f"Skipping duplicate OHLC candle at timestamp {timestamp}")
+                # Deduplicate existing data
+                seen_timestamps = {candle[0] for candle in existing_data if isinstance(candle, list) and len(candle) >= 7}
+                valid_ohlc = []
+                for candle in ohlc:
+                    if not isinstance(candle, list) or len(candle) < 7:
+                        logger.debug(f"Skipping invalid OHLC candle: {candle}")
                         continue
-                    float(candle[4])  # Validate close price
-                    float(candle[6])  # Validate volume
-                    valid_ohlc.append(candle)
-                    seen_timestamps.add(timestamp)
-                except (ValueError, TypeError) as e:
-                    logger.debug(f"Skipping invalid OHLC candle due to error: {e}, candle: {candle}")
-                    continue
+                    try:
+                        timestamp = float(candle[0])
+                        if timestamp in seen_timestamps:
+                            logger.debug(f"Skipping duplicate OHLC candle at timestamp {timestamp}")
+                            continue
+                        float(candle[4])  # Validate close price
+                        float(candle[6])  # Validate volume
+                        valid_ohlc.append(candle)
+                        seen_timestamps.add(timestamp)
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Skipping invalid OHLC candle due to error: {e}, candle: {candle}")
+                        continue
 
-            existing_data.extend(valid_ohlc)
-            # Sort all data by timestamp
-            existing_data.sort(key=lambda x: x[0] if isinstance(x, list) and len(x) >= 1 else float('inf'))
-            with open(self.price_history_file, 'w') as f:
-                json.dump(existing_data, f)
-            logger.info(f"Appended {len(valid_ohlc)} valid OHLC candles to {self.price_history_file}")
-        except Exception as e:
-            logger.error(f"Failed to append OHLC data: {e}")
+                existing_data.extend(valid_ohlc)
+                # Sort all data by timestamp
+                existing_data.sort(key=lambda x: x[0] if isinstance(x, list) and len(x) >= 1 else float('inf'))
+                
+                # Write with exclusive lock to prevent corruption
+                with open(self.price_history_file, 'w') as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        json.dump(existing_data, f)
+                    finally:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                
+                logger.info(f"Appended {len(valid_ohlc)} valid OHLC candles to {self.price_history_file}")
+                return
+            except json.JSONDecodeError as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"JSON decode error (attempt {attempt + 1}/{max_retries}), retrying: {e}")
+                    time.sleep(0.5)
+                else:
+                    logger.error(f"Failed to append OHLC data after {max_retries} attempts: {e}")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to append OHLC data (attempt {attempt + 1}/{max_retries}), retrying: {e}")
+                    time.sleep(0.5)
+                else:
+                    logger.error(f"Failed to append OHLC data after {max_retries} attempts: {e}")
 
     def log_strategy(self, **kwargs) -> None:
         max_retries = 3

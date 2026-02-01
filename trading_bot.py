@@ -465,7 +465,10 @@ class TradingBot:
         # =============================================================================
         
         hold_reasons = []
-        if buy_score < required_buy_signals:
+        # Check if we had a score that was too low
+        if 'buy_analysis' in locals() and hasattr(buy_analysis, 'total_score'):
+            hold_reasons.append(f"insufficient buy signals ({buy_analysis.total_score:.1f}/{buy_threshold:.1f})")
+        elif 'buy_score' in locals():
             hold_reasons.append(f"insufficient buy signals ({buy_score}/{required_buy_signals})")
         if profit_margin < 12:
             hold_reasons.append(f"profits below threshold ({profit_margin:.1f}% < 12%)")
