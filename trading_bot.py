@@ -18,6 +18,8 @@ import requests
 from market_data_service import MarketDataService
 from enhanced_buy_signals import EnhancedBuySignalDetector
 from tiered_profit_taking import TieredProfitTakingSystem
+from support_resistance import SupportResistanceDetector
+from dynamic_position_sizing import DynamicPositionSizer, PositionMetrics
 
 class TradingBot:
     def __init__(self, data_manager: DataManager, trade_executor: TradeExecutor, onchain_analyzer: OnChainAnalyzer, order_manager: OrderManager = None, market_data_service: MarketDataService = None):
@@ -59,6 +61,15 @@ class TradingBot:
         self.profit_taker = TieredProfitTakingSystem()
         self.tier_history = {}  # Track which tiers have been hit per position
         logger.info("✅ Tiered profit taking system initialized (Phase 8 Task 2 optimization)")
+        
+        # Initialize support/resistance detector (Phase 8 Task 4)
+        self.sr_detector = SupportResistanceDetector()
+        logger.info("✅ Support/Resistance detector initialized (Phase 8 Task 4 optimization)")
+        
+        # Initialize dynamic position sizer (Phase 8 Task 3)
+        self.position_sizer = DynamicPositionSizer()
+        logger.info("✅ Dynamic position sizer initialized (Phase 8 Task 3 optimization)")
+        
         self.last_sentiment = 0
 
     def _initialize_price_history(self):
@@ -459,6 +470,88 @@ class TradingBot:
         logger.info(f"⏸️ HOLD: {', '.join(hold_reasons) if hold_reasons else 'market neutral'}")
         return 'hold'
 
+    def calculate_enhanced_position_size_with_all_factors(self, action: str, indicators_data: Dict, 
+                                                         btc_balance: float, eur_balance: float) -> float:
+        """
+        ===== PHASE 8 FULL INTEGRATION =====
+        Calculate position size using ALL Phase 8 optimization modules:
+        - Task 1: Enhanced Buy Signals (signal quality)
+        - Task 2: Tiered Profit Taking (profit levels)
+        - Task 3: Dynamic Position Sizing (7 adjustment factors)
+        - Task 4: Support/Resistance (reward:risk context)
+        """
+        try:
+            current_price = indicators_data.get('current_price', 1)
+            price_history = indicators_data.get('price_history', [current_price])
+            
+            # Get support/resistance levels (Task 4)
+            support, resistance = self.sr_detector.detect_levels(price_history, current_price)
+            sr_analysis = self.sr_detector.analyze_current_position(current_price, support, resistance)
+            
+            # Prepare metrics for DynamicPositionSizer (Task 3)
+            performance = indicators_data.get('performance_report', {})
+            win_rate = float(performance.get('risk_metrics', {}).get('win_rate', '0%').rstrip('%')) / 100 if performance else 0.5
+            
+            position_metrics = PositionMetrics(
+                available_capital=eur_balance if action == 'buy' else btc_balance,
+                current_price=current_price,
+                signal_quality=min(1.0, indicators_data.get('signal_quality', 0.5)),
+                risk_off_probability=indicators_data.get('news_analysis', {}).get('risk_off_probability', 0),
+                win_rate=win_rate,
+                volatility=indicators_data.get('volatility', 0.02),
+                max_drawdown=float(performance.get('risk_metrics', {}).get('max_drawdown_pct', '0%').rstrip('%')) / 100 if performance else 0,
+                consecutive_losses=int(performance.get('trade_stats', {}).get('consecutive_losses', 0)) if performance else 0,
+                market_regime_name=indicators_data.get('market_trend', 'CONSOLIDATION'),
+                profit_percentage=((current_price - indicators_data.get('avg_buy_price', current_price)) / 
+                                 indicators_data.get('avg_buy_price', 1) * 100) if action == 'sell' else 0
+            )
+            
+            # Use DynamicPositionSizer (Task 3)
+            if action == 'buy':
+                sizing = self.position_sizer.calculate_buy_size(position_metrics)
+                base_position_btc = sizing.position_size_btc
+            else:
+                sizing = self.position_sizer.calculate_sell_size(position_metrics)
+                base_position_btc = sizing.position_size_btc
+            
+            # Apply support/resistance optimization (Task 4)
+            if sr_analysis.reward_risk_ratio > 1.5:
+                rr_boost = min(1.3, sr_analysis.reward_risk_ratio / 2.0)
+                base_position_btc *= rr_boost
+                logger.info(f"💎 R:R BOOST: {sr_analysis.reward_risk_ratio:.2f}x → {rr_boost:.2f}x position increase")
+            elif sr_analysis.reward_risk_ratio < 1.0:
+                logger.warning(f"⚠️ POOR R:R: {sr_analysis.reward_risk_ratio:.2f}x → SKIPPING trade")
+                return 0
+            
+            # Apply tiered profit taking constraints for sells (Task 2)
+            if action == 'sell' and btc_balance > 0:
+                profit_percent = ((current_price - indicators_data.get('avg_buy_price', current_price)) / 
+                                 indicators_data.get('avg_buy_price', 1) * 100)
+                
+                if profit_percent > 0:
+                    tier_analysis = self.profit_taker.check_profit_tiers(
+                        buy_price=indicators_data.get('avg_buy_price', current_price),
+                        current_price=current_price,
+                        position_size=btc_balance
+                    )
+                    
+                    if tier_analysis.active_tiers:
+                        # Use tiered system for profit taking
+                        for tier_info in tier_analysis.active_tiers:
+                            base_position_btc = min(base_position_btc, tier_info['sale_amount'])
+                        logger.info(f"📊 TIERED PROFIT: Capping sell to {base_position_btc:.8f} BTC")
+            
+            logger.info(f"🎯 PHASE 8 INTEGRATED SIZING: {action.upper()} {base_position_btc:.8f} BTC "
+                       f"| S/R: {sr_analysis.reward_risk_ratio:.2f}x R:R | "
+                       f"Signal: {sizing.adjustment_factors.get('signal_quality', 1.0):.2f}x | "
+                       f"Risk: {sizing.adjustment_factors.get('risk_off', 1.0):.2f}x")
+            
+            return base_position_btc
+            
+        except Exception as e:
+            logger.warning(f"Phase 8 full integration failed, falling back: {e}")
+            return self.calculate_risk_adjusted_position_size(action, indicators_data, btc_balance, eur_balance)
+
     def calculate_risk_adjusted_position_size(self, action: str, indicators_data: Dict, btc_balance: float, eur_balance: float) -> float:
         """
         IMPROVED: Much more conservative position sizing for Bitcoin accumulation.
@@ -547,6 +640,41 @@ class TradingBot:
                 
                 risk_multiplier *= strength_multiplier * quality_factor
                 
+                # ===== PHASE 8 TASK 4 INTEGRATION: Support/Resistance Analysis =====
+                # Adjust position sizing based on support/resistance context
+                try:
+                    support, resistance = self.sr_detector.detect_levels(
+                        indicators_data.get('price_history', []),
+                        indicators_data.get('current_price', 1)
+                    )
+                    sr_analysis = self.sr_detector.analyze_current_position(
+                        indicators_data.get('current_price', 1), support, resistance
+                    )
+                    
+                    # Reward:risk ratio adjustment
+                    if sr_analysis.reward_risk_ratio > 0:
+                        # Boost position size for favorable R:R ratios
+                        rr_multiplier = min(1.5, sr_analysis.reward_risk_ratio / 2.0)
+                        risk_multiplier *= rr_multiplier
+                        
+                        logger.info(f"💎 S/R ANALYSIS: R:R={sr_analysis.reward_risk_ratio:.2f}x, "
+                                   f"Support={sr_analysis.nearest_support.price if sr_analysis.nearest_support else 'N/A'}, "
+                                   f"Resistance={sr_analysis.nearest_resistance.price if sr_analysis.nearest_resistance else 'N/A'}")
+                    
+                    # Reduce position if near strong resistance
+                    if sr_analysis.is_near_resistance and sr_analysis.resistance_strength >= 3:
+                        risk_multiplier *= 0.7
+                        logger.warning(f"⚠️ NEAR STRONG RESISTANCE: Reducing position size by 30%")
+                    
+                    # Increase confidence if near strong support
+                    if sr_analysis.is_near_support and sr_analysis.support_strength >= 3:
+                        risk_multiplier *= 1.2
+                        logger.info(f"✅ NEAR STRONG SUPPORT: Increasing position size by 20%")
+                
+                except Exception as e:
+                    logger.warning(f"S/R analysis failed, continuing with signal-based sizing: {e}")
+                # ===== END PHASE 8 TASK 4 INTEGRATION =====
+                
                 logger.info(f"📈 SIGNAL-BASED POSITION SIZING: Strength={buy_analysis.strength.name} "
                            f"({strength_multiplier:.1f}x), Quality={quality_factor:.2f}x, "
                            f"Combined Multiplier={risk_multiplier:.2f}x")
@@ -596,9 +724,15 @@ class TradingBot:
 
     def decide_amount(self, action: str, indicators_data: Dict, btc_balance: float, eur_balance: float) -> float:
         """
-        Calculate position size using the enhanced risk-adjusted method.
+        Calculate position size using Phase 8 integrated system (Tasks 1-4).
+        Falls back to risk-adjusted sizing if integration fails.
         """
-        return self.calculate_risk_adjusted_position_size(action, indicators_data, btc_balance, eur_balance)
+        # Try Phase 8 full integration first
+        try:
+            return self.calculate_enhanced_position_size_with_all_factors(action, indicators_data, btc_balance, eur_balance)
+        except Exception as e:
+            logger.warning(f"Phase 8 integration unavailable, using standard sizing: {e}")
+            return self.calculate_risk_adjusted_position_size(action, indicators_data, btc_balance, eur_balance)
 
     def _call_ollama(self, prompt: str) -> str:
         payload = {
