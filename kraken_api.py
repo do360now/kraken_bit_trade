@@ -332,6 +332,35 @@ class KrakenAPI:
             logger.error(f"Failed to fetch OHLC data for {pair}", error=str(e))
             return []
     
+    def get_latest_ohlc(self, pair: str = "XXBTZEUR", interval: int = 15) -> Optional[List]:
+        """
+        Fetch the latest OHLC candle for a pair.
+        
+        This is a convenience method used by MarketDataService for getting
+        the most recent price data.
+        
+        Args:
+            pair: Trading pair (default BTC/EUR)
+            interval: Candle interval in minutes (default 15)
+        
+        Returns:
+            Latest OHLC candle (list) or None if error
+        """
+        try:
+            # Fetch last 2 hours of data to ensure we get the latest candle
+            since = int(time.time() - 7200)
+            ohlc_data = self.get_ohlc_data(pair=pair, interval=interval, since=since)
+            
+            if ohlc_data and len(ohlc_data) > 0:
+                return ohlc_data[-1]  # Return the most recent candle
+            
+            logger.warning(f"No OHLC data available for {pair}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch latest OHLC for {pair}: {e}")
+            return None
+    
     def get_available_balance(self, asset: str) -> Optional[float]:
         """
         Get available balance for an asset, accounting for locked funds.

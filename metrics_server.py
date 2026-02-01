@@ -175,7 +175,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
 class MetricsServer:
     """Metrics server for the trading bot"""
     
-    def __init__(self, trading_bot, port=8080):
+    def __init__(self, trading_bot, port=8081):
         self.trading_bot = trading_bot
         self.port = port
         self.server = None
