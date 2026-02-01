@@ -16,6 +16,7 @@ from performance_tracker import PerformanceTracker
 from metrics_server import MetricsServer
 import requests
 from market_data_service import MarketDataService
+from enhanced_buy_signals import EnhancedBuySignalDetector
 
 class TradingBot:
     def __init__(self, data_manager: DataManager, trade_executor: TradeExecutor, onchain_analyzer: OnChainAnalyzer, order_manager: OrderManager = None, market_data_service: MarketDataService = None):
@@ -48,6 +49,10 @@ class TradingBot:
         self.ollama_url = "http://localhost:11434/api/generate"  # Assuming Ollama runs locally
         self.model_name = "gemma3:4b"
         self.last_rsi = 0
+        
+        # Initialize enhanced buy signal detector (Phase 8 improvement)
+        self.buy_signal_detector = EnhancedBuySignalDetector()
+        logger.info("✅ Enhanced buy signal detector initialized (Phase 8 optimization)")
         self.last_sentiment = 0
 
     def _initialize_price_history(self):
@@ -326,35 +331,73 @@ class TradingBot:
             return 'hold'
         
         # =============================================================================
-        # BUY CONDITIONS - Aggressive accumulation in dips
+        # BUY CONDITIONS - Enhanced weighted signal detection (Phase 8)
         # =============================================================================
         
-        # 8. STRONG BUY SIGNALS (multiple confirmations needed)
-        buy_signals = [
-            rsi < 45,
-            current_price < vwap * 0.98,  # Below VWAP
-            netflow < -3000,  # Exchange outflow = accumulation
-            sentiment > -0.1,  # Not extremely negative
-            macd > signal or abs(macd - signal) < 5,
-        ]
+        # Use enhanced buy signal detector with weighted scoring (1-10 points)
+        # Prepare indicator data for detector
+        detector_indicators = {
+            'rsi': rsi,
+            'macd': macd,
+            'signal_line': signal,
+            'vwap': vwap,
+            'current_price': current_price,
+            'ma_short': indicators_data.get('ma_short', vwap),
+            'ma_long': ma_long,
+            'netflow': netflow,
+            'risk_off_probability': risk_off_prob,
+            'sentiment': sentiment,
+            'volatility': volatility,
+        }
         
-        buy_score = sum(buy_signals)
+        # Prepare price history for support/resistance detection
+        price_history = indicators_data.get('price_history', [current_price])
         
-        # Bonus signals for aggressive buying
-        if rsi < 30:  # Very oversold
-            buy_score += 1
-            logger.info(f"🔥 VERY OVERSOLD BOOST: RSI {rsi:.1f}")
+        try:
+            # Get enhanced buy analysis with weighted scoring
+            buy_analysis = self.buy_signal_detector.analyze_buy_opportunity(
+                indicators_data=detector_indicators,
+                price_history=price_history
+            )
+            
+            logger.info(f"📊 ENHANCED BUY ANALYSIS: Score={buy_analysis.total_score:.1f}/10, "
+                       f"Strength={buy_analysis.strength.name}, Quality={buy_analysis.opportunity_quality:.0f}%")
+            
+            # Decision thresholds based on signal strength and market conditions
+            buy_threshold = 3.0 if is_bull_market else 4.0  # Lower threshold in bull markets
+            
+            # Make buy decision based on weighted score
+            if buy_analysis.total_score >= buy_threshold:
+                logger.info(f"✅ BUY CONDITIONS MET: Weighted score {buy_analysis.total_score:.1f} >= {buy_threshold:.1f}")
+                logger.info(f"   Strength: {buy_analysis.strength.name}")
+                logger.info(f"   Quality: {buy_analysis.opportunity_quality:.0f}%")
+                logger.info(f"   Recommendation: {buy_analysis.recommendation}")
+                logger.info(f"   Components: RSI={buy_analysis.components.get('oversold', 0):.1f}pts, "
+                           f"VWAP Dip={buy_analysis.components.get('vwap_dip', 0):.1f}pts, "
+                           f"Whale={buy_analysis.components.get('whale_activity', 0):.1f}pts, "
+                           f"Technical={buy_analysis.components.get('technical', 0):.1f}pts")
+                if buy_analysis.supports_nearby:
+                    logger.info(f"   Support Levels: {', '.join([f'€{s:.0f}' for s in buy_analysis.supports_nearby[:2]])}")
+                return 'buy'
+            else:
+                logger.info(f"⏳ BUY SIGNALS INSUFFICIENT: Score {buy_analysis.total_score:.1f} < {buy_threshold:.1f} threshold")
         
-        if netflow < -8000:  # Strong accumulation
-            buy_score += 1
-            logger.info(f"🐋 STRONG ACCUMULATION BOOST: Netflow {netflow:.0f}")
-        
-        # LOWER threshold in bull markets (accumulate more aggressively)
-        required_buy_signals = 3 if is_bull_market else 4
-        
-        if buy_score >= required_buy_signals:
-            logger.info(f"✅ BUY CONDITIONS MET: {buy_score}/{required_buy_signals} signals")
-            return 'buy'
+        except Exception as e:
+            logger.error(f"❌ Error in enhanced buy signal detection: {e}", exc_info=True)
+            # Fallback to original logic if detector fails
+            buy_signals = [
+                rsi < 45,
+                current_price < vwap * 0.98,
+                netflow < -3000,
+                sentiment > -0.1,
+                macd > signal or abs(macd - signal) < 5,
+            ]
+            buy_score = sum(buy_signals)
+            required_buy_signals = 3 if is_bull_market else 4
+            
+            if buy_score >= required_buy_signals:
+                logger.info(f"✅ BUY CONDITIONS MET (FALLBACK): {buy_score}/{required_buy_signals} signals")
+                return 'buy'
         
         # =============================================================================
         # TECHNICAL SELL CONDITIONS - Very strict
@@ -433,16 +476,63 @@ class TradingBot:
         if win_rate < 0.35:
             risk_multiplier *= 0.7
         
-        # BUYING: Aggressive in good conditions
+        # BUYING: Aggressive in good conditions with enhanced signal weighting
         if action == 'buy':
             rsi = indicators_data.get('rsi', 50)
             netflow = indicators_data.get('netflow', 0)
+            price_history = indicators_data.get('price_history', [indicators_data.get('current_price', 1)])
             
-            # Increase buy size in great conditions
-            if rsi < 30 and netflow < -8000 and risk_off_prob < 0.2:
-                risk_multiplier *= 1.8  # Very aggressive in extreme dips
-            elif rsi < 35 and netflow < -5000:
-                risk_multiplier *= 1.4  # Aggressive in dips
+            # Get signal strength from enhanced detector (Phase 8 improvement)
+            detector_indicators = {
+                'rsi': rsi,
+                'macd': indicators_data.get('macd', 0),
+                'signal_line': indicators_data.get('signal', 0),
+                'vwap': indicators_data.get('vwap', indicators_data.get('current_price', 1)),
+                'current_price': indicators_data.get('current_price', 1),
+                'ma_short': indicators_data.get('ma_short', indicators_data.get('vwap', 1)),
+                'ma_long': indicators_data.get('ma_long', indicators_data.get('current_price', 1)),
+                'netflow': netflow,
+                'risk_off_probability': risk_off_prob,
+                'sentiment': indicators_data.get('sentiment', 0),
+                'volatility': volatility,
+            }
+            
+            try:
+                buy_analysis = self.buy_signal_detector.analyze_buy_opportunity(
+                    indicators_data=detector_indicators,
+                    price_history=price_history
+                )
+                
+                # Scale position based on signal strength (Phase 8 enhancement)
+                signal_strength_multipliers = {
+                    'EXTREME': 1.8,      # 1.8x - rare mega-dip, max deployment
+                    'VERY_STRONG': 1.5,  # 1.5x - strong dip, large position
+                    'STRONG': 1.2,       # 1.2x - normal dip, normal position
+                    'MODERATE': 0.8,     # 0.8x - weak signals, small position
+                    'WEAK': 0.4,         # 0.4x - minimal signals, tiny position
+                    'NO_SIGNAL': 0.0,    # 0x - no buy
+                }
+                
+                strength_multiplier = signal_strength_multipliers.get(
+                    buy_analysis.strength.name, 1.0
+                )
+                
+                # Also factor in opportunity quality (0-100%)
+                quality_factor = 0.5 + (buy_analysis.opportunity_quality / 200.0)  # 0.5 to 1.0
+                
+                risk_multiplier *= strength_multiplier * quality_factor
+                
+                logger.info(f"📈 SIGNAL-BASED POSITION SIZING: Strength={buy_analysis.strength.name} "
+                           f"({strength_multiplier:.1f}x), Quality={quality_factor:.2f}x, "
+                           f"Combined Multiplier={risk_multiplier:.2f}x")
+            
+            except Exception as e:
+                logger.warning(f"Could not apply signal strength multiplier: {e}")
+                # Fall back to original logic
+                if rsi < 30 and netflow < -8000 and risk_off_prob < 0.2:
+                    risk_multiplier *= 1.8
+                elif rsi < 35 and netflow < -5000:
+                    risk_multiplier *= 1.4
             
             position_eur = eur_balance * base_buy_pct * risk_multiplier
             current_price = indicators_data.get('current_price', 1)
