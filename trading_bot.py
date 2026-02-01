@@ -20,6 +20,7 @@ from enhanced_buy_signals import EnhancedBuySignalDetector
 from tiered_profit_taking import TieredProfitTakingSystem
 from support_resistance import SupportResistanceDetector
 from dynamic_position_sizing import DynamicPositionSizer, PositionMetrics
+from intraday_volatility_scalping import IntraDayVolatilityScalper
 
 class TradingBot:
     def __init__(self, data_manager: DataManager, trade_executor: TradeExecutor, onchain_analyzer: OnChainAnalyzer, order_manager: OrderManager = None, market_data_service: MarketDataService = None):
@@ -69,6 +70,10 @@ class TradingBot:
         # Initialize dynamic position sizer (Phase 8 Task 3)
         self.position_sizer = DynamicPositionSizer()
         logger.info("✅ Dynamic position sizer initialized (Phase 8 Task 3 optimization)")
+        
+        # Initialize intraday volatility scalper (Phase 8 Task 5)
+        self.volatility_scalper = IntraDayVolatilityScalper()
+        logger.info("✅ Intraday volatility scalper initialized (Phase 8 Task 5 optimization)")
         
         self.last_sentiment = 0
 
