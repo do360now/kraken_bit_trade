@@ -37,7 +37,7 @@ class TradingBot:
         self.last_trade_time = 0
         self.max_cash_allocation = 0.9
         self.min_eur_for_trade = 5.0
-        self.min_trade_volume = 0.00005
+        self.min_trade_volume = 0.0001  # Kraken minimum for XXBTZEUR (more conservative than 0.00005)
         self.recent_buys = []
         self._load_recent_buys()
         self.performance_tracker = PerformanceTracker(
@@ -497,27 +497,61 @@ class TradingBot:
             performance = indicators_data.get('performance_report', {})
             win_rate = float(performance.get('risk_metrics', {}).get('win_rate', '0%').rstrip('%')) / 100 if performance else 0.5
             
+            # Get signal strength from enhanced buy signal detector
+            signal_quality_value = min(1.0, indicators_data.get('signal_quality', 0.5))
+            if signal_quality_value >= 0.85:
+                signal_strength_str = 'EXTREME'
+            elif signal_quality_value >= 0.70:
+                signal_strength_str = 'VERY_STRONG'
+            elif signal_quality_value >= 0.55:
+                signal_strength_str = 'STRONG'
+            elif signal_quality_value >= 0.40:
+                signal_strength_str = 'MODERATE'
+            else:
+                signal_strength_str = 'WEAK'
+            
             position_metrics = PositionMetrics(
-                available_capital=eur_balance if action == 'buy' else btc_balance,
-                current_price=current_price,
-                signal_quality=min(1.0, indicators_data.get('signal_quality', 0.5)),
-                risk_off_probability=indicators_data.get('news_analysis', {}).get('risk_off_probability', 0),
+                signal_quality=signal_quality_value * 100,  # Convert to 0-100
+                signal_strength=signal_strength_str,
+                risk_off_probability=indicators_data.get('news_analysis', {}).get('risk_off_probability', 0.0),
                 win_rate=win_rate,
+                sharpe_ratio=float(performance.get('risk_metrics', {}).get('sharpe_ratio', 0.0)) if performance else 0.0,
+                drawdown=float(performance.get('risk_metrics', {}).get('max_drawdown_pct', '0%').rstrip('%')) / 100 if performance else 0.0,
                 volatility=indicators_data.get('volatility', 0.02),
-                max_drawdown=float(performance.get('risk_metrics', {}).get('max_drawdown_pct', '0%').rstrip('%')) / 100 if performance else 0,
+                market_regime=indicators_data.get('market_trend', 'CONSOLIDATION'),
+                trade_frequency=int(performance.get('trade_stats', {}).get('total_trades', 0)) if performance else 0,
                 consecutive_losses=int(performance.get('trade_stats', {}).get('consecutive_losses', 0)) if performance else 0,
-                market_regime_name=indicators_data.get('market_trend', 'CONSOLIDATION'),
-                profit_percentage=((current_price - indicators_data.get('avg_buy_price', current_price)) / 
-                                 indicators_data.get('avg_buy_price', 1) * 100) if action == 'sell' else 0
+                confidence_score=signal_quality_value * 100  # Convert to 0-100
             )
             
             # Use DynamicPositionSizer (Task 3)
+            current_price = indicators_data.get('current_price', 0)
             if action == 'buy':
-                sizing = self.position_sizer.calculate_buy_size(position_metrics)
-                base_position_btc = sizing.position_size_btc
+                sizing = self.position_sizer.calculate_buy_size(
+                    available_capital=eur_balance,
+                    metrics=position_metrics,
+                    current_price=current_price
+                )
+                # Convert percentage to BTC amount (sizing values are already in decimal form, e.g., 0.30 = 30%)
+                position_pct = sizing.adjusted_size_pct if sizing.adjusted_size_pct else sizing.base_size_pct
+                base_position_btc = (position_pct * eur_balance / current_price) if current_price > 0 else 0.0
             else:
-                sizing = self.position_sizer.calculate_sell_size(position_metrics)
-                base_position_btc = sizing.position_size_btc
+                # Calculate profit margin for sell size
+                avg_buy_price = indicators_data.get('avg_buy_price', current_price)
+                if avg_buy_price and avg_buy_price > 0:
+                    profit_margin = ((current_price - avg_buy_price) / avg_buy_price * 100)
+                else:
+                    profit_margin = 0
+                
+                sizing = self.position_sizer.calculate_sell_size(
+                    btc_balance=btc_balance,
+                    metrics=position_metrics,
+                    current_price=current_price,
+                    profit_margin=profit_margin
+                )
+                # Convert percentage to BTC amount
+                position_pct = sizing.adjusted_size_pct / 100.0 if sizing.adjusted_size_pct else sizing.base_size_pct / 100.0
+                base_position_btc = position_pct * btc_balance
             
             # Apply support/resistance optimization (Task 4)
             if sr_analysis.reward_risk_ratio > 1.5:
@@ -548,8 +582,8 @@ class TradingBot:
             
             logger.info(f"🎯 PHASE 8 INTEGRATED SIZING: {action.upper()} {base_position_btc:.8f} BTC "
                        f"| S/R: {sr_analysis.reward_risk_ratio:.2f}x R:R | "
-                       f"Signal: {sizing.adjustment_factors.get('signal_quality', 1.0):.2f}x | "
-                       f"Risk: {sizing.adjustment_factors.get('risk_off', 1.0):.2f}x")
+                       f"Signal: {sizing.adjustments.get('signal_quality', 1.0):.2f}x | "
+                       f"Risk: {sizing.adjustments.get('risk_off', 1.0):.2f}x")
             
             return base_position_btc
             
@@ -570,15 +604,21 @@ class TradingBot:
             return 0.0
         
         # BASE POSITION SIZES (more conservative for sells)
-        base_buy_pct = 0.10  # 10% of EUR balance (slightly more aggressive for accumulation)
+        base_buy_pct = 0.25  # 25% of EUR balance (increased from 10% to compensate for Phase 8 risk reductions)
         base_sell_pct = 0.08  # 8% of BTC balance (much less than current 12%)
         
         # Risk adjustments
         news_analysis = indicators_data.get('news_analysis', {})
         risk_off_prob = news_analysis.get('risk_off_probability', 0)
         volatility = indicators_data.get('volatility', 0.02)
-        profit_margin = ((indicators_data.get('current_price', 0) - indicators_data.get('avg_buy_price', 1)) 
-                        / indicators_data.get('avg_buy_price', 1) * 100)
+        
+        # Calculate profit margin safely
+        avg_buy_price = indicators_data.get('avg_buy_price', None)
+        current_price = indicators_data.get('current_price', 0)
+        if avg_buy_price and current_price and avg_buy_price > 0:
+            profit_margin = ((current_price - avg_buy_price) / avg_buy_price * 100)
+        else:
+            profit_margin = 0
         
         # Performance adjustment
         performance = indicators_data.get('performance_report', {})
@@ -882,6 +922,14 @@ class TradingBot:
                 if trade_volume <= 0:
                     action = 'hold'
                     reason = "Zero volume calculated; holding"
+                # ===== KRAKEN MINIMUM ORDER SIZE VALIDATION =====
+                # Kraken's minimum order size is approximately 0.0001 BTC
+                elif trade_volume < self.min_trade_volume:
+                    logger.warning(f"⚠️ MINIMUM ORDER SIZE VIOLATION: Calculated {trade_volume:.8f} BTC "
+                                  f"is below Kraken minimum ({self.min_trade_volume:.8f} BTC). Skipping {action}.")
+                    action = 'hold'
+                    reason = f"Order size {trade_volume:.8f} BTC below minimum {self.min_trade_volume:.8f} BTC"
+                # ===== END MINIMUM ORDER VALIDATION =====
 
             buy_decision = action == 'buy'
             sell_decision = action == 'sell'

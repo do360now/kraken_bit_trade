@@ -81,10 +81,10 @@ class DynamicPositionSizer:
     """
     
     # Base position sizes (% of available capital)
-    BASE_BUY_SIZE = 0.10     # 10% per buy
-    BASE_SELL_SIZE = 0.08    # 8% per sell
-    MAX_POSITION_SIZE = 0.25 # Never exceed 25% on single trade
-    MIN_POSITION_SIZE = 0.02 # Never go below 2%
+    BASE_BUY_SIZE = 0.30     # 30% per buy (arithmetic mean prevents over-reduction)
+    BASE_SELL_SIZE = 0.12    # 12% per sell
+    MAX_POSITION_SIZE = 0.50 # Never exceed 50% on single trade
+    MIN_POSITION_SIZE = 0.05 # Never go below 5%
     
     # Adjustment limits
     MAX_ADJUSTMENT = 1.5     # Never exceed 1.5x
@@ -343,20 +343,18 @@ class DynamicPositionSizer:
             return 1.5
     
     def _combine_adjustments(self, factors: list) -> float:
-        """Combine multiple adjustment factors using geometric mean"""
+        """Combine multiple adjustment factors using weighted mean (70% keep base, 30% apply adjustments)"""
         if not factors:
             return 1.0
         
-        product = 1.0
-        for factor in factors:
-            product *= factor
-        
-        # Geometric mean
-        geometric_mean = product ** (1.0 / len(factors))
+        # Use weighted mean: 70% of base (1.0) + 30% of factor average
+        # This is less conservative than arithmetic mean, prevents over-reduction
+        arithmetic_mean = sum(factors) / len(factors) if factors else 1.0
+        weighted_mean = 0.7 * 1.0 + 0.3 * arithmetic_mean
         
         # Clamp to limits
         return max(self.MIN_ADJUSTMENT, 
-                  min(self.MAX_ADJUSTMENT, geometric_mean))
+                  min(self.MAX_ADJUSTMENT, weighted_mean))
     
     def _generate_buy_explanation(
         self, metrics: PositionMetrics, adjustments: Dict, size_pct: float

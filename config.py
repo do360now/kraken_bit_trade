@@ -39,7 +39,7 @@ class Config:
     
     # Trading parameters
     TOTAL_BTC = float(os.getenv("TOTAL_BTC", "0.01"))
-    MIN_TRADE_VOLUME = float(os.getenv("MIN_TRADE_VOLUME", "0.00005"))
+    MIN_TRADE_VOLUME = float(os.getenv("MIN_TRADE_VOLUME", "0.0001"))  # Kraken minimum for XXBTZEUR
     MIN_EUR_FOR_TRADE = float(os.getenv("MIN_EUR_FOR_TRADE", "15.0"))
     MIN_BTC = float(os.getenv("MIN_BTC", "10"))
     
