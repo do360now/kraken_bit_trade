@@ -17,6 +17,7 @@ from metrics_server import MetricsServer
 import requests
 from market_data_service import MarketDataService
 from enhanced_buy_signals import EnhancedBuySignalDetector
+from tiered_profit_taking import TieredProfitTakingSystem
 
 class TradingBot:
     def __init__(self, data_manager: DataManager, trade_executor: TradeExecutor, onchain_analyzer: OnChainAnalyzer, order_manager: OrderManager = None, market_data_service: MarketDataService = None):
@@ -53,6 +54,11 @@ class TradingBot:
         # Initialize enhanced buy signal detector (Phase 8 improvement)
         self.buy_signal_detector = EnhancedBuySignalDetector()
         logger.info("✅ Enhanced buy signal detector initialized (Phase 8 optimization)")
+        
+        # Initialize tiered profit taking system (Phase 8 Task 2)
+        self.profit_taker = TieredProfitTakingSystem()
+        self.tier_history = {}  # Track which tiers have been hit per position
+        logger.info("✅ Tiered profit taking system initialized (Phase 8 Task 2 optimization)")
         self.last_sentiment = 0
 
     def _initialize_price_history(self):
@@ -294,25 +300,44 @@ class TradingBot:
             return 'sell'
         
         # =============================================================================
-        # HIGH PROFIT CONDITIONS - Take significant profits
+        # HIGH PROFIT CONDITIONS - Tiered profit taking (Phase 8 Task 2)
         # =============================================================================
         
-        # 3. MAJOR PROFIT TARGET (25%+ gains)
-        if profit_margin > 25:
-            # Even in bull markets, 25% is worth taking SOME profit
-            logger.info(f"💰💰 MAJOR PROFITS: {profit_margin:.1f}% - PARTIAL PROFIT TAKING")
-            return 'sell'
-        
-        # 4. STRONG PROFIT + EXTREME OVERBOUGHT (15%+ gains)
-        if profit_margin > 15 and rsi > 80:
-            # Price is extremely overbought AND we have good profits
-            logger.info(f"💰 STRONG PROFITS + EXTREME OVERBOUGHT: {profit_margin:.1f}% - TAKE PROFITS")
-            return 'sell'
-        
-        # 5. GOOD PROFIT + BEARISH SIGNALS (in non-bull markets)
-        if not is_bull_market:  # DON'T sell in bull markets unless extreme
-            if profit_margin > 12 and rsi > 75:
-                logger.info(f"💰 GOOD PROFITS + OVERBOUGHT (no bull trend): {profit_margin:.1f}% - TAKE PROFITS")
+        # Check for tiered profit opportunities
+        try:
+            tier_analysis = self.profit_taker.analyze_tiered_profits(
+                current_price=current_price,
+                avg_buy_price=avg_buy_price,
+                btc_balance=self.trade_executor.get_total_btc_balance() or 0.001,
+                tier_history=self.tier_history
+            )
+            
+            if tier_analysis.should_sell:
+                # Log tier analysis
+                logger.info(tier_analysis.recommendation)
+                from tiered_profit_taking import log_tier_details
+                log_tier_details(tier_analysis)
+                
+                # Update tier history to mark this tier as taken
+                for tier in tier_analysis.active_tiers:
+                    self.tier_history[tier] = True
+                
+                logger.info(f"💰 TIERED PROFIT: Tier {tier_analysis.highest_active_tier} triggered - "
+                           f"Selling {tier_analysis.total_position_reduction*100:.0f}% "
+                           f"(recovering €{tier_analysis.total_capital_recovery:.0f})")
+                return 'sell'
+            
+            # Also check for emergency/major profit conditions
+            # 3. MAJOR PROFIT TARGET (25%+ gains) - above all tiers
+            if profit_margin > 25:
+                logger.info(f"💰💰 MAJOR PROFITS BEYOND TIERS: {profit_margin:.1f}% - PARTIAL PROFIT TAKING")
+                return 'sell'
+            
+        except Exception as e:
+            logger.warning(f"Error in tiered profit taking: {e}", exc_info=True)
+            # Fallback to simple logic
+            if profit_margin > 25:
+                logger.info(f"💰💰 MAJOR PROFITS: {profit_margin:.1f}% - PARTIAL PROFIT TAKING")
                 return 'sell'
         
         # =============================================================================
