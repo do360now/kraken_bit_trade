@@ -81,10 +81,10 @@ class DynamicPositionSizer:
     """
     
     # Base position sizes (% of available capital)
-    BASE_BUY_SIZE = 0.30     # 30% per buy (arithmetic mean prevents over-reduction)
-    BASE_SELL_SIZE = 0.12    # 12% per sell
-    MAX_POSITION_SIZE = 0.50 # Never exceed 50% on single trade
-    MIN_POSITION_SIZE = 0.05 # Never go below 5%
+    BASE_BUY_SIZE = 0.50     # 50% per buy to ensure positions meet Kraken minimum (~0.0001 BTC)
+    BASE_SELL_SIZE = 0.20    # 20% per sell
+    MAX_POSITION_SIZE = 1.0  # Never exceed 100% on single trade
+    MIN_POSITION_SIZE = 0.10 # Never go below 10%
     
     # Adjustment limits
     MAX_ADJUSTMENT = 1.5     # Never exceed 1.5x

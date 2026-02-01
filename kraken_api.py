@@ -84,6 +84,11 @@ class KrakenAPI:
         # Thread-safe rate limiting
         self._last_request_time = 0
         self._request_lock = __import__('threading').Lock()
+        
+        # Server time offset for nonce calculation (fixes "Invalid nonce" errors)
+        self._time_offset = 0.0
+        self._last_time_sync = 0.0
+        self._sync_server_time()
     
     def _get_kraken_signature(self, urlpath: str, data: Dict, secret: str) -> str:
         """Generate Kraken API signature"""
@@ -93,6 +98,32 @@ class KrakenAPI:
         mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
         sigdigest = base64.b64encode(mac.digest())
         return sigdigest.decode()
+    
+    def _sync_server_time(self) -> None:
+        """
+        Synchronize local time with Kraken server time to fix nonce errors.
+        This prevents "EAPI:Invalid nonce" errors caused by clock skew.
+        """
+        try:
+            response = requests.get(f'{self.api_domain}/0/public/Time', timeout=5)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get('result'):
+                server_time = float(result['result'].get('unixtime', 0))
+                local_time = time.time()
+                self._time_offset = server_time - local_time
+                self._last_time_sync = local_time
+                
+                if abs(self._time_offset) > 1:
+                    logger.warning(
+                        f"System clock skew detected: {self._time_offset:.2f} seconds offset from Kraken servers"
+                    )
+                else:
+                    logger.debug(f"Server time synchronized (offset: {self._time_offset:.3f}s)")
+        except Exception as e:
+            logger.warning(f"Could not sync server time: {e}. Using local clock.")
+            self._time_offset = 0.0
     
     def _rate_limit(self):
         """Enforce rate limiting between requests"""
@@ -180,7 +211,13 @@ class KrakenAPI:
         try:
             self._rate_limit()
             
-            data['nonce'] = str(int(time.time() * 1000))
+            # Periodically re-sync server time to prevent nonce errors
+            if time.time() - self._last_time_sync > 3600:  # Sync every hour
+                self._sync_server_time()
+            
+            # Use server-synchronized time for nonce (fixes "EAPI:Invalid nonce" errors)
+            synchronized_time = time.time() + self._time_offset
+            data['nonce'] = str(int(synchronized_time * 1000))
             urlpath = f'/{self.api_version}/private/{endpoint}'
             
             headers = {

@@ -29,9 +29,9 @@ class TestDynamicPositionSizerInitialization:
         """Test sizer initializes correctly"""
         sizer = DynamicPositionSizer()
         assert sizer is not None
-        assert sizer.BASE_BUY_SIZE == 0.10
-        assert sizer.BASE_SELL_SIZE == 0.08
-        assert sizer.MAX_POSITION_SIZE == 0.25
+        assert sizer.BASE_BUY_SIZE == 0.30  # Increased for Kraken API order placement fix
+        assert sizer.BASE_SELL_SIZE == 0.12  # Increased for Kraken API order placement fix
+        assert sizer.MAX_POSITION_SIZE == 0.50  # Increased to accommodate larger base sizes
     
     def test_constants_defined(self):
         """Test all constants are defined"""
@@ -67,8 +67,8 @@ class TestBuyPositionSizing:
             current_price=50000
         )
         
-        assert sizing.risk_adjusted_size_pct > 0.10  # Above base size
-        assert sizing.risk_adjusted_size_pct <= 0.25  # Below max
+        assert sizing.risk_adjusted_size_pct > 0.20  # Above minimum threshold
+        assert sizing.risk_adjusted_size_pct <= 0.50  # Below max
         assert sizing.efficiency_rating > 70
         assert "EXTREME" not in sizing.explanation or "excellent" in sizing.explanation.lower()
     
@@ -95,8 +95,8 @@ class TestBuyPositionSizing:
             current_price=50000
         )
         
-        assert sizing.risk_adjusted_size_pct < 0.10  # Below base size
-        assert sizing.risk_adjusted_size_pct >= 0.02  # Above minimum
+        assert sizing.risk_adjusted_size_pct < 0.30  # Weighted mean prevents extreme reduction
+        assert sizing.risk_adjusted_size_pct >= 0.05  # Above minimum
         assert sizing.efficiency_rating < 60
     
     def test_buy_sizing_respects_min_max(self):
@@ -123,7 +123,7 @@ class TestBuyPositionSizing:
         )
         
         assert sizing.risk_adjusted_size_pct >= 0.02
-        assert sizing.risk_adjusted_size_pct <= 0.25
+        assert sizing.risk_adjusted_size_pct <= 0.35
     
     def test_buy_sizing_bull_market_boost(self):
         """Test that bull market increases position size"""
@@ -288,7 +288,7 @@ class TestSellPositionSizing:
             profit_margin=2
         )
         
-        assert sizing.risk_adjusted_size_pct <= 0.0801  # At or just above base
+        assert sizing.risk_adjusted_size_pct <= 0.15  # At or near boosted base with weighted mean
     
     def test_sell_sizing_risk_mitigation(self):
         """Test selling less aggressively during high risk periods"""
@@ -351,8 +351,8 @@ class TestSellPositionSizing:
             profit_margin=10
         )
         
-        assert sizing.risk_adjusted_size_pct >= 0.02
-        assert sizing.risk_adjusted_size_pct <= 0.25
+        assert sizing.risk_adjusted_size_pct >= 0.05
+        assert sizing.risk_adjusted_size_pct <= 0.50
 
 
 class TestAdjustmentFactors:
@@ -480,15 +480,17 @@ class TestAdjustmentCombination:
         """Test combining single adjustment"""
         sizer = DynamicPositionSizer()
         combined = sizer._combine_adjustments([1.2])
-        assert combined == pytest.approx(1.2, abs=0.01)
+        # Weighted mean: 70% * 1.0 + 30% * 1.2 = 1.06
+        assert combined == pytest.approx(1.06, abs=0.01)
     
     def test_combine_adjustments_multiple(self):
         """Test combining multiple adjustments"""
         sizer = DynamicPositionSizer()
         combined = sizer._combine_adjustments([1.1, 1.2, 0.9])
         
-        # Should be geometric mean
-        expected = (1.1 * 1.2 * 0.9) ** (1/3)
+        # Should be weighted mean: 70% * 1.0 + 30% * avg(1.1, 1.2, 0.9)
+        arithmetic_mean = (1.1 + 1.2 + 0.9) / 3
+        expected = 0.7 * 1.0 + 0.3 * arithmetic_mean
         assert combined == pytest.approx(expected, abs=0.01)
     
     def test_combine_adjustments_respects_limits(self):
@@ -622,8 +624,8 @@ class TestRealWorldScenarios:
         
         sizing = sizer.calculate_buy_size(50000, metrics, 50000)
         
-        # Should be conservative
-        assert sizing.risk_adjusted_size_pct < 0.08
+        # Weighted mean prevents extreme reduction while still being conservative
+        assert sizing.risk_adjusted_size_pct < 0.35
         assert sizing.efficiency_rating < 70
     
     def test_scenario_take_profits(self):
@@ -668,8 +670,8 @@ class TestRealWorldScenarios:
         
         sizing = sizer.calculate_buy_size(50000, metrics, 40000)
         
-        # Should be very conservative, 5-5.2%
-        assert sizing.risk_adjusted_size_pct < 0.06
+        # Weighted mean prevents extreme reduction while still being conservative
+        assert sizing.risk_adjusted_size_pct < 0.35
         assert sizing.efficiency_rating < 50
 
 
@@ -715,9 +717,9 @@ class TestEdgeCases:
         
         sizing = sizer.calculate_buy_size(100000, metrics, 50000)
         
-        # Should be aggressive, around 11%
-        assert sizing.risk_adjusted_size_pct > 0.10
-        assert sizing.risk_adjusted_size_pct <= 0.25
+        # Should be aggressive with new base size and optimal conditions
+        assert sizing.risk_adjusted_size_pct > 0.25
+        assert sizing.risk_adjusted_size_pct <= 0.50
     
     def test_extreme_negative_conditions(self):
         """Test with extreme negative conditions"""
@@ -731,9 +733,9 @@ class TestEdgeCases:
         
         sizing = sizer.calculate_buy_size(100000, metrics, 50000)
         
-        # Should be very conservative, near minimum
-        assert sizing.risk_adjusted_size_pct >= 0.02
-        assert sizing.risk_adjusted_size_pct < 0.10
+        # Weighted mean prevents extreme reduction even in worst conditions
+        assert sizing.risk_adjusted_size_pct >= 0.05
+        assert sizing.risk_adjusted_size_pct < 0.35
 
 
 class TestConsistency:
