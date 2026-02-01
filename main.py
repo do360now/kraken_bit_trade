@@ -10,6 +10,7 @@ from kraken_api import KrakenAPI
 from config import API_KEY, API_SECRET, API_DOMAIN, PRICE_HISTORY_FILE, BOT_LOGS_FILE
 from logger_config import logger
 from order_manager import OrderManager
+from market_data_service import MarketDataService
 
 
 
@@ -22,7 +23,8 @@ def main():
     data_manager = DataManager(PRICE_HISTORY_FILE, BOT_LOGS_FILE)
     trade_executor = TradeExecutor(kraken_api)
     onchain_analyzer = OnChainAnalyzer()
-    bot = TradingBot(data_manager, trade_executor, onchain_analyzer, order_manager)
+    market_data_service = MarketDataService(exchange_client=kraken_api)
+    bot = TradingBot(data_manager, trade_executor, onchain_analyzer, order_manager, market_data_service)
 
     # Set up signal handlers for graceful shutdown
     def signal_handler(sig, frame):

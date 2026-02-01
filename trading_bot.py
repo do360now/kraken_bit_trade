@@ -15,9 +15,10 @@ from logger_config import logger
 from performance_tracker import PerformanceTracker
 from metrics_server import MetricsServer
 import requests
+from market_data_service import MarketDataService
 
 class TradingBot:
-    def __init__(self, data_manager: DataManager, trade_executor: TradeExecutor, onchain_analyzer: OnChainAnalyzer, order_manager: OrderManager = None):
+    def __init__(self, data_manager: DataManager, trade_executor: TradeExecutor, onchain_analyzer: OnChainAnalyzer, order_manager: OrderManager = None, market_data_service: MarketDataService = None):
         self.max_position_size = 0.15
         self.stop_loss_percentage = 0.03
         self.take_profit_percentage = 0.10
@@ -27,6 +28,7 @@ class TradingBot:
         self.trade_executor = trade_executor
         self.onchain_analyzer = onchain_analyzer
         self.order_manager = order_manager
+        self.market_data_service = market_data_service
         self.last_trade_time = 0
         self.max_cash_allocation = 0.9
         self.min_eur_for_trade = 5.0
@@ -570,11 +572,9 @@ class TradingBot:
                 logger.warning("Insufficient price data")
                 return
 
-            current_price, current_volume = self.trade_executor.fetch_current_price()
-            if not current_price:
-                logger.error("Failed to fetch current price")
-                return
-
+            # Get current price from market data service
+            price_obj = self.market_data_service.current_price()
+            current_price = price_obj.value
             self.price_history.append(current_price)
             self.price_history = self.price_history[-self.lookback_period * 4:]
 
