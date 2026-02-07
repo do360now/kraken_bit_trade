@@ -24,7 +24,7 @@ from datetime import datetime
 from logger_config import logger
 
 
-@dataclass
+@dataclass(frozen=True)
 class Position:
     """Current portfolio position snapshot."""
     btc_amount: float
@@ -84,7 +84,8 @@ class PositionManager:
         # History tracking
         self._buy_price_history: list = []
         self._portfolio_value_history: list = []
-        self._trades_count = 0
+        self._buy_trades_count = 0  # Count only buy trades
+        self._sell_trades_count = 0  # Count only sell trades
         self._winning_trades = 0
         self._fees_paid = 0.0
 
@@ -126,17 +127,20 @@ class PositionManager:
             is_buy: True if buy, False if sell
             fee_eur: Trading fee in EUR
         """
-        self._trades_count += 1
         self._fees_paid += fee_eur
 
         if is_buy:
-            # Update average buy price
-            cost = btc_amount * price
-            total_cost = (self._avg_buy_price * self._btc_balance) + cost
+            cost = btc_amount * price + fee_eur
+            self._eur_balance -= cost  # Subtract from EUR
+            total_cost = (self._avg_buy_price * self._btc_balance) + (btc_amount * price)
             self._btc_balance += btc_amount
             if self._btc_balance > 0:
                 self._avg_buy_price = total_cost / self._btc_balance
+            
         else:
+            proceeds = btc_amount * price - fee_eur
+            self._eur_balance += proceeds  # Add to EUR
+            self._sell_trades_count += 1
             # Selling - check if profitable
             if self._avg_buy_price > 0:
                 pnl = (price - self._avg_buy_price) * btc_amount
@@ -207,10 +211,10 @@ class PositionManager:
         unrealized_gain = btc_value - cost_basis
         unrealized_gain_pct = (unrealized_gain / cost_basis * 100) if cost_basis > 0 else 0
 
-        # Win rate
+        # Win rate (only based on sell trades, since each sell is either a win or loss)
         win_rate = (
-            self._winning_trades / self._trades_count * 100
-            if self._trades_count > 0
+            self._winning_trades / self._sell_trades_count * 100
+            if self._sell_trades_count > 0
             else 0
         )
 
@@ -229,9 +233,9 @@ class PositionManager:
             win_rate=win_rate,
             sharpe_ratio=sharpe_ratio,
             max_drawdown=max_drawdown,
-            total_trades=self._trades_count,
+            total_trades=self._buy_trades_count + self._sell_trades_count,
             winning_trades=self._winning_trades,
-            losing_trades=self._trades_count - self._winning_trades,
+            losing_trades=self._sell_trades_count - self._winning_trades,
         )
 
     # =========================================================================

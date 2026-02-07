@@ -413,7 +413,7 @@ class TradeExecutor:
             filled_at=datetime.now(),
             reason="Order filled",
         )
-        self.filled_orders[trade_id] = trade
+        self.filled_orders[order_id] = trade  # ← Changed from trade_id to order_id
         logger.info(f"Trade executed: {btc_filled} BTC @ €{price}")
         return trade
 
