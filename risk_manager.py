@@ -1,425 +1,396 @@
 """
-RiskManager - Cycle-Aware Risk Assessment and Position Sizing
+Risk manager — cycle-aware risk gating for the trading bot.
 
-UPDATED: Now integrates CycleAnalyzer to adjust ALL risk parameters
-based on where we are in the Bitcoin halving cycle.
+Decides whether a trade is allowed, enforces emergency sell logic with
+golden rule floor protection, manages drawdown tracking, and provides
+cycle-adjusted stop levels.
 
-PUBLIC INTERFACE:
-    assess_risk(portfolio) -> RiskMetrics
-    can_buy(portfolio) -> bool
-    can_sell(portfolio) -> bool
-    calculate_position_size(available_eur, price, portfolio) -> float
-    should_emergency_sell(portfolio) -> bool
-    get_cycle_adjusted_stops(entry_price, current_price) -> Dict
+Key lessons from previous bot:
+- Golden rule floor protection: don't emergency sell above estimated cycle floor.
+- Bear capitulation override: allow DCA buys even at elevated risk levels.
+- Reserve floor: never go below 20% of starting EUR balance.
+- Daily trade count limits with proper reset logic.
 
-CYCLE INTEGRATION POINTS:
-    - Position sizing scaled by cycle phase multiplier + DCA intensity
-    - Stop-loss width adjusted by phase volatility expectations
-    - Buy/sell gates shift based on cycle phase
-    - Emergency sell respects "golden rule" floor estimate
-    - Bear capitulation overrides risk blocks for small DCA buys
+Design:
+- can_trade() is the main gate: returns (allowed, reason) for every decision.
+- emergency_sell() checks if portfolio is in danger requiring immediate exit.
+- get_stops() provides cycle-adjusted stop-loss levels.
+- All state is persisted for restart recovery.
+- Never raises exceptions past the public interface.
 """
+from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
-from enum import Enum
-from logger_config import logger
-from cycle_analyzer import CycleAnalyzer, CyclePhase, CycleAdjustments
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from config import BotConfig, CyclePhase, RiskConfig, PersistenceConfig
+from cycle_detector import CycleState
+from signal_engine import Action, CompositeSignal
+
+logger = logging.getLogger(__name__)
 
 
-class RiskLevel(Enum):
-    """Risk level classification."""
-    LOW = "low"
-    MODERATE = "moderate"
-    HIGH = "high"
-    CRITICAL = "critical"
+# ─── Output dataclasses ──────────────────────────────────────────────────────
 
-
-@dataclass
-class RiskMetrics:
-    """Risk assessment results — now includes cycle context."""
-    risk_level: RiskLevel
-    risk_score: float  # 0.0 to 1.0
-    can_trade: bool
-    position_size_adjustment: float  # Combined risk + cycle multiplier
+@dataclass(frozen=True)
+class RiskDecision:
+    """Result of a risk check."""
+    allowed: bool
     reason: str
-    cycle_phase: Optional[CyclePhase] = None
-    accumulation_score: Optional[float] = None
+    override_active: bool = False  # True if capitulation override engaged
 
 
-@dataclass
+@dataclass(frozen=True)
+class StopLevels:
+    """Cycle-adjusted stop-loss levels for an open position."""
+    stop_price: float         # Hard stop — exit if price drops below this
+    warning_price: float      # Soft warning — reduce position if hit
+    atr_width: float          # ATR-based distance from entry to stop
+
+    @property
+    def valid(self) -> bool:
+        """Stop levels are valid if prices are positive and ordered."""
+        return 0 < self.stop_price < self.warning_price
+
+
+@dataclass(frozen=True)
 class PortfolioState:
-    """Current portfolio state for risk calculations."""
-    btc_balance: float
+    """Current portfolio snapshot for risk assessment."""
     eur_balance: float
-    current_price: float
-    avg_buy_price: float
-    unrealized_pnl: float
-    win_rate: float
-    volatility: float
-    max_daily_drawdown: float
+    btc_balance: float
+    btc_price: float
+    starting_eur: float       # Initial EUR balance for reserve floor calc
 
+    @property
+    def total_value_eur(self) -> float:
+        """Total portfolio value in EUR."""
+        return self.eur_balance + self.btc_balance * self.btc_price
+
+    @property
+    def btc_value_eur(self) -> float:
+        return self.btc_balance * self.btc_price
+
+    @property
+    def eur_allocation(self) -> float:
+        """Fraction of portfolio in EUR (0.0–1.0)."""
+        total = self.total_value_eur
+        if total <= 0:
+            return 1.0
+        return self.eur_balance / total
+
+    @property
+    def btc_allocation(self) -> float:
+        """Fraction of portfolio in BTC (0.0–1.0)."""
+        return 1.0 - self.eur_allocation
+
+
+# ─── Risk Manager ────────────────────────────────────────────────────────────
 
 class RiskManager:
     """
-    Manages all risk-related decisions with cycle awareness.
+    Cycle-aware risk management gate.
 
-    Philosophy:
-    - Conservative by default, but modulated by cycle phase
-    - Bear capitulation = be GREEDY (override normal risk blocks)
-    - Euphoria/distribution = be CAUTIOUS (tighter everything)
-    - Emergency sells respect the "golden rule" floor estimate
+    Every trade attempt passes through can_trade() before execution.
+    The risk manager tracks drawdowns, enforces reserve floors, limits
+    daily trade counts, and provides emergency sell logic.
+
+    Args:
+        config: Bot configuration (risk parameters).
     """
 
-    def __init__(
+    def __init__(self, config: BotConfig) -> None:
+        self._cfg = config.risk
+        self._persistence = config.persistence
+
+        # Mutable state
+        self._daily_trade_count: int = 0
+        self._trade_count_date: str = ""  # ISO date for reset tracking
+        self._peak_portfolio_eur: float = 0.0
+        self._starting_eur: Optional[float] = None
+
+        self._load_state()
+
+    # ─── Public interface ────────────────────────────────────────────────
+
+    def can_trade(
         self,
-        max_position_pct: float = 0.15,
-        stop_loss_pct: float = 0.03,
-        take_profit_pct: float = 0.10,
-        max_daily_trades: int = 8,
-        max_drawdown_pct: float = 0.15,
-        risk_per_trade: float = 0.01,
-        cycle_analyzer: Optional[CycleAnalyzer] = None,
-    ):
-        self.max_position_pct = max_position_pct
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
-        self.max_daily_trades = max_daily_trades
-        self.max_drawdown_pct = max_drawdown_pct
-        self.risk_per_trade = risk_per_trade
-
-        # Cycle awareness — optional, falls back to neutral if not provided
-        self.cycle = cycle_analyzer or CycleAnalyzer(current_cycle=4)
-
-        # Cache to avoid recalculating on every call within the same tick
-        self._cached_adjustments: Optional[CycleAdjustments] = None
-        self._cached_price: Optional[float] = None
-
-        # Risk thresholds
-        self.high_volatility_threshold = 0.08
-        self.critical_volatility_threshold = 0.12
-        self.max_position_concentration = 0.25
-
-        # Daily tracking
-        self.daily_trade_count = 0
-        self.today_pnl = 0.0
-        self.peak_portfolio_value = 1.0
-
-    # =========================================================================
-    # CYCLE HELPERS
-    # =========================================================================
-
-    def _get_cycle_adj(self, price: float) -> CycleAdjustments:
-        """Get cached cycle adjustments (refreshes if price moved >1%)."""
-        if (
-            self._cached_adjustments is None
-            or self._cached_price is None
-            or abs(price - self._cached_price) / max(self._cached_price, 1) > 0.01
-        ):
-            self._cached_adjustments = self.cycle.get_cycle_adjustments(price)
-            self._cached_price = price
-        return self._cached_adjustments
-
-    # =========================================================================
-    # PUBLIC INTERFACE
-    # =========================================================================
-
-    def assess_risk(self, portfolio: PortfolioState) -> RiskMetrics:
-        """
-        Comprehensive risk assessment WITH cycle modulation.
-
-        The cycle phase adjusts:
-        - Volatility thresholds (wider in accumulation, tighter in distribution)
-        - Drawdown tolerance (more in accumulation, less in euphoria)
-        - Concentration limits (higher allowed in accumulation)
-        - Final risk score dampened/amplified by phase risk_tolerance
-        """
-        cycle_adj = self._get_cycle_adj(portfolio.current_price)
-        risk_score = 0.0
-        reasons = []
-
-        # --- Volatility check (cycle-adjusted thresholds) ---
-        vol_high = self.high_volatility_threshold * cycle_adj.stop_loss_width
-        vol_critical = self.critical_volatility_threshold * cycle_adj.stop_loss_width
-
-        if portfolio.volatility > vol_critical:
-            risk_score += 0.6
-            reasons.append("CRITICAL volatility")
-        elif portfolio.volatility > vol_high:
-            risk_score += 0.2
-            reasons.append("HIGH volatility")
-
-        # --- Drawdown check (cycle-adjusted tolerance) ---
-        max_drawdown = self._calculate_drawdown(portfolio)
-        # In accumulation phases, tolerate more drawdown
-        dd_tolerance = self.max_drawdown_pct
-        if cycle_adj.risk_tolerance > 0:
-            dd_tolerance = self.max_drawdown_pct / cycle_adj.risk_tolerance
-        if max_drawdown > dd_tolerance:
-            risk_score += 0.3
-            reasons.append("Excessive drawdown")
-
-        # --- Position concentration (cycle-adjusted) ---
-        total_value = portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-        concentration = (
-            (portfolio.btc_balance * portfolio.current_price) / total_value
-            if total_value > 0 else 0
-        )
-        # Allow higher concentration during strong accumulation phases
-        max_conc = self.max_position_concentration * (
-            1 + cycle_adj.buy_aggressiveness * 0.15
-        )
-        if concentration > max_conc:
-            risk_score += 0.2
-            reasons.append("High position concentration")
-
-        # --- Win rate check ---
-        if portfolio.win_rate < 0.4:
-            risk_score += 0.15
-            reasons.append("Low win rate")
-
-        # --- Apply cycle dampener ---
-        # High risk_tolerance (accumulation) reduces effective score
-        # Low risk_tolerance (distribution) amplifies it
-        dampener = 1.0 - (cycle_adj.risk_tolerance - 0.5) * 0.3
-        risk_score *= max(0.5, min(1.5, dampener))
-
-        # --- Classify risk level ---
-        if risk_score >= 0.7:
-            risk_level = RiskLevel.CRITICAL
-            pos_adj = 0.25
-            can_trade = False
-        elif risk_score >= 0.5:
-            risk_level = RiskLevel.HIGH
-            pos_adj = 0.5
-            can_trade = True
-        elif risk_score >= 0.3:
-            risk_level = RiskLevel.MODERATE
-            pos_adj = 0.75
-            can_trade = True
-        else:
-            risk_level = RiskLevel.LOW
-            pos_adj = 1.0
-            can_trade = True
-
-        # Apply cycle position multiplier ON TOP of risk adjustment
-        pos_adj *= cycle_adj.position_size_multiplier
-
-        reason = "; ".join(reasons) if reasons else "All risk metrics within acceptable range"
-        reason = f"[{cycle_adj.phase.value}] {reason}"
-
-        accum_score = self.cycle.get_accumulation_score(portfolio.current_price)
-
-        logger.info(
-            f"Risk: {risk_level.value} (score={risk_score:.2f}) | "
-            f"Phase={cycle_adj.phase.value} | AccumScore={accum_score:.0f} | "
-            f"PosAdj={pos_adj:.1%}"
-        )
-
-        return RiskMetrics(
-            risk_level=risk_level,
-            risk_score=risk_score,
-            can_trade=can_trade,
-            position_size_adjustment=pos_adj,
-            reason=reason,
-            cycle_phase=cycle_adj.phase,
-            accumulation_score=accum_score,
-        )
-
-    def can_buy(self, portfolio: PortfolioState) -> bool:
-        """
-        Check if buying is allowed.
-
-        Cycle-aware: bear capitulation OVERRIDES risk blocks for small DCA buys.
-        """
-        risk_metrics = self.assess_risk(portfolio)
-        cycle_adj = self._get_cycle_adj(portfolio.current_price)
-
-        if not risk_metrics.can_trade:
-            # Override: allow small buys during bear capitulation even at high risk
-            if cycle_adj.phase == CyclePhase.BEAR_CAPITULATION:
-                logger.warning(
-                    "⚠️ Risk block OVERRIDDEN — BEAR_CAPITULATION allows small DCA buys"
-                )
-                return True
-            logger.warning(f"⛔ Cannot buy — {risk_metrics.reason}")
-            return False
-
-        if self.daily_trade_count >= self.max_daily_trades:
-            logger.warning(f"⛔ Cannot buy — daily limit ({self.daily_trade_count})")
-            return False
-
-        min_eur = 5.0 / max(cycle_adj.buy_aggressiveness, 0.1)
-        if portfolio.eur_balance < min_eur:
-            logger.warning(f"⛔ Cannot buy — €{portfolio.eur_balance:.2f} < min €{min_eur:.2f}")
-            return False
-
-        logger.info(f"✅ Buy allowed (phase: {cycle_adj.phase.value})")
-        return True
-
-    def can_sell(self, portfolio: PortfolioState) -> bool:
-        """
-        Check if selling is allowed.
-
-        Cycle-aware: during strong accumulation phases, require higher
-        profit margins before allowing a sell.
-        """
-        if portfolio.btc_balance < 0.00001:
-            logger.warning("⛔ Cannot sell — no BTC position")
-            return False
-
-        cycle_adj = self._get_cycle_adj(portfolio.current_price)
-
-        # In strong accumulation, block sells unless significantly profitable
-        if cycle_adj.sell_reluctance >= 2.0 and portfolio.avg_buy_price > 0:
-            profit_pct = (
-                (portfolio.current_price - portfolio.avg_buy_price)
-                / portfolio.avg_buy_price
-            )
-            min_profit = 0.05 * cycle_adj.sell_reluctance
-            if profit_pct < min_profit:
-                logger.info(
-                    f"⛔ Sell blocked by {cycle_adj.phase.value}: "
-                    f"profit {profit_pct:.1%} < required {min_profit:.1%}"
-                )
-                return False
-
-        logger.info("✅ Sell allowed")
-        return True
-
-    def should_emergency_sell(self, portfolio: PortfolioState) -> bool:
-        """
-        Determine if we should force-sell to protect capital.
-
-        CYCLE-AWARE: If price is near or above the estimated "golden rule" floor,
-        DON'T emergency sell — historical patterns say it will recover.
-        """
-        risk_metrics = self.assess_risk(portfolio)
-        if risk_metrics.risk_level != RiskLevel.CRITICAL:
-            return False
-
-        cycle_adj = self._get_cycle_adj(portfolio.current_price)
-        floor_eur = cycle_adj.estimated_floor_eur
-
-        # Golden rule protection: if we're above the estimated floor, hold
-        if portfolio.current_price >= floor_eur * 0.90:
-            logger.info(
-                f"🛡️ Emergency sell BLOCKED: €{portfolio.current_price:,.0f} "
-                f"near cycle floor €{floor_eur:,.0f} — golden rule protection"
-            )
-            return False
-
-        # Standard emergency: critical risk AND significant unrealized loss
-        total_value = portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-        if portfolio.unrealized_pnl < -0.05 * total_value:
-            logger.error("🚨 EMERGENCY SELL — below golden rule floor with losses")
-            return True
-
-        return False
-
-    def calculate_position_size(
-        self,
-        available_eur: float,
-        current_price: float,
+        signal: CompositeSignal,
         portfolio: PortfolioState,
-        base_position_pct: float = 0.10,
-    ) -> float:
+        cycle: CycleState,
+    ) -> RiskDecision:
         """
-        Calculate position size with full cycle + risk integration.
+        Main risk gate — determines if a trade should proceed.
 
-        Cycle phase DIRECTLY scales position:
-        - Bear capitulation: up to 2x normal * 2x DCA = 4x effective
-        - Post-halving: 1.5x * 1.5 DCA = 2.25x
-        - Euphoria: 0.5x * 0.5 DCA = 0.25x
-        - Distribution: 0.3x * 0.3 DCA = 0.09x
+        Checks in order:
+        1. Daily trade limit
+        2. Reserve floor (for buys)
+        3. Drawdown tolerance (cycle-adjusted)
+        4. Capitulation override (for buys in bear markets)
+
+        Returns RiskDecision with allowed flag and reason.
         """
-        if available_eur <= 0 or current_price <= 0:
-            return 0.0
+        # Initialize starting EUR on first call
+        if self._starting_eur is None:
+            self._starting_eur = portfolio.eur_balance + portfolio.btc_value_eur
+            self._peak_portfolio_eur = self._starting_eur
+            self._save_state()
 
-        risk_metrics = self.assess_risk(portfolio)
-        cycle_adj = self._get_cycle_adj(current_price)
+        # Update peak portfolio value
+        current_total = portfolio.total_value_eur
+        if current_total > self._peak_portfolio_eur:
+            self._peak_portfolio_eur = current_total
 
-        # Base position in EUR
-        position_eur = available_eur * base_position_pct
+        # ── Check 1: Daily trade limit ───────────────────────────────
+        self._maybe_reset_daily_count()
+        if self._daily_trade_count >= self._cfg.max_daily_trades:
+            return RiskDecision(
+                allowed=False,
+                reason=f"Daily trade limit reached ({self._cfg.max_daily_trades})",
+            )
 
-        # Apply combined risk + cycle adjustment
-        position_eur *= risk_metrics.position_size_adjustment
+        # ── Direction-specific checks ────────────────────────────────
+        if signal.is_buy:
+            return self._check_buy_risk(portfolio, cycle)
+        elif signal.is_sell:
+            return self._check_sell_risk(portfolio, cycle)
+        else:
+            return RiskDecision(allowed=False, reason="Signal is HOLD — no trade")
 
-        # Apply DCA intensity from cycle phase
-        position_eur *= cycle_adj.dca_intensity
+    def emergency_sell(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+    ) -> RiskDecision:
+        """
+        Check if an emergency sell is needed.
 
-        # Cap at max position (also cycle-scaled, hard cap at 30%)
-        max_pct = min(self.max_position_pct * cycle_adj.position_size_multiplier, 0.30)
-        max_eur = available_eur * max_pct
-        position_eur = min(position_eur, max_eur)
+        Golden rule: don't emergency sell if price is above the estimated
+        cycle floor. Emergency sells only trigger when the portfolio is in
+        genuine danger AND price is below a level that suggests structural
+        breakdown rather than normal volatility.
+        """
+        if not self._cfg.enable_golden_rule_floor:
+            # Golden rule disabled — use simple drawdown check
+            drawdown = self._portfolio_drawdown(portfolio)
+            if drawdown > cycle.drawdown_tolerance * 1.5:
+                return RiskDecision(
+                    allowed=True,
+                    reason=f"Emergency: drawdown {drawdown:.1%} exceeds "
+                           f"1.5x tolerance ({cycle.drawdown_tolerance * 1.5:.1%})",
+                )
+            return RiskDecision(allowed=False, reason="No emergency condition")
 
-        # Minimum trade size
-        min_eur = 5.0
-        if risk_metrics.can_trade or cycle_adj.phase == CyclePhase.BEAR_CAPITULATION:
-            position_eur = max(position_eur, min_eur)
+        # Golden rule floor protection
+        floor = cycle.price_structure.position_in_range
+        drawdown = self._portfolio_drawdown(portfolio)
 
-        btc_amount = position_eur / current_price
+        # Only emergency sell if:
+        # 1. Drawdown exceeds 1.5x the phase tolerance
+        # 2. Price is in the bottom 15% of the estimated range (near floor)
+        extreme_drawdown = drawdown > cycle.drawdown_tolerance * 1.5
+        near_floor = floor < 0.15
 
-        logger.info(
-            f"Position: {btc_amount:.8f} BTC (€{position_eur:.2f}) | "
-            f"Phase={cycle_adj.phase.value} | "
-            f"RiskAdj={risk_metrics.position_size_adjustment:.0%} | "
-            f"DCA={cycle_adj.dca_intensity:.1f}x"
+        if extreme_drawdown and near_floor:
+            return RiskDecision(
+                allowed=True,
+                reason=f"Emergency: drawdown {drawdown:.1%} with price near "
+                       f"cycle floor (range position={floor:.2f})",
+            )
+
+        if extreme_drawdown and not near_floor:
+            logger.warning(
+                f"Drawdown extreme ({drawdown:.1%}) but price not near floor "
+                f"(range={floor:.2f}). Golden rule holding — no emergency sell."
+            )
+            return RiskDecision(
+                allowed=False,
+                reason=f"Golden rule: drawdown {drawdown:.1%} but price "
+                       f"above floor (range={floor:.2f}). Holding.",
+            )
+
+        return RiskDecision(allowed=False, reason="No emergency condition")
+
+    def get_stops(
+        self,
+        entry_price: float,
+        current_price: float,
+        cycle: CycleState,
+        atr_value: Optional[float] = None,
+    ) -> StopLevels:
+        """
+        Compute cycle-adjusted stop-loss levels.
+
+        Stop width scales with:
+        - ATR (volatility-based distance)
+        - Cycle phase (wider in accumulation, tighter in distribution)
+        - A configurable multiplier
+
+        Args:
+            entry_price: Price at which position was entered.
+            current_price: Current market price.
+            cycle: Current cycle state.
+            atr_value: Current ATR value. If None, uses 2% of price as fallback.
+        """
+        if atr_value is None or atr_value <= 0:
+            atr_value = current_price * 0.02  # 2% fallback
+
+        # Phase-adjusted ATR multiplier
+        phase_multipliers = {
+            CyclePhase.CAPITULATION: 3.5,     # Wide — expect volatility
+            CyclePhase.ACCUMULATION: 3.0,
+            CyclePhase.EARLY_BULL: 2.5,
+            CyclePhase.GROWTH: 2.0,
+            CyclePhase.EUPHORIA: 1.5,         # Tight — protect profits
+            CyclePhase.DISTRIBUTION: 1.5,
+            CyclePhase.EARLY_BEAR: 2.0,
+        }
+        phase_mult = phase_multipliers.get(cycle.phase, self._cfg.stop_atr_multiplier)
+
+        atr_width = atr_value * phase_mult
+        stop_price = max(0.0, entry_price - atr_width)
+        warning_price = max(stop_price, entry_price - atr_width * 0.6)
+
+        return StopLevels(
+            stop_price=stop_price,
+            warning_price=warning_price,
+            atr_width=atr_width,
         )
 
-        return btc_amount
+    def record_trade(self) -> None:
+        """Record that a trade was executed. Updates daily count."""
+        self._maybe_reset_daily_count()
+        self._daily_trade_count += 1
+        self._save_state()
+        logger.info(f"Trade recorded. Daily count: {self._daily_trade_count}")
 
-    def get_cycle_adjusted_stops(
-        self, entry_price: float, current_price: float
-    ) -> Dict[str, float]:
-        """
-        Calculate cycle-adjusted stop-loss and take-profit levels.
+    def get_drawdown(self, portfolio: PortfolioState) -> float:
+        """Current portfolio drawdown from peak (0.0–1.0)."""
+        return self._portfolio_drawdown(portfolio)
 
-        Returns:
-            Dict with stop_loss, take_profit prices and percentages
-        """
-        cycle_adj = self._get_cycle_adj(current_price)
+    # ─── Private checks ──────────────────────────────────────────────────
 
-        sl_pct = self.stop_loss_pct * cycle_adj.stop_loss_width
-        tp_pct = self.take_profit_pct * cycle_adj.take_profit_width
+    def _check_buy_risk(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+    ) -> RiskDecision:
+        """Risk checks specific to buy orders."""
+        # Reserve floor: never go below reserve_floor_pct of starting EUR
+        starting = self._starting_eur or portfolio.total_value_eur
+        reserve_floor = starting * self._cfg.reserve_floor_pct
 
-        stop_loss = entry_price * (1 - sl_pct)
-        take_profit = entry_price * (1 + tp_pct)
+        if portfolio.eur_balance <= reserve_floor:
+            return RiskDecision(
+                allowed=False,
+                reason=f"EUR balance €{portfolio.eur_balance:,.0f} at or below "
+                       f"reserve floor €{reserve_floor:,.0f} "
+                       f"({self._cfg.reserve_floor_pct:.0%} of starting)",
+            )
 
-        # Floor protection: stop loss never below 95% of estimated cycle floor
-        floor = cycle_adj.estimated_floor_eur
-        if stop_loss < floor * 0.95:
-            stop_loss = floor * 0.95
-            logger.debug(f"Stop loss clamped to cycle floor: €{stop_loss:,.0f}")
+        # Drawdown check
+        drawdown = self._portfolio_drawdown(portfolio)
+        tolerance = cycle.drawdown_tolerance
 
-        return {
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "stop_loss_pct": sl_pct,
-            "take_profit_pct": tp_pct,
-            "phase": cycle_adj.phase.value,
-        }
+        if drawdown > tolerance:
+            # Capitulation override: allow buys during capitulation
+            # even at elevated drawdowns (DCA into the bottom)
+            if (self._cfg.enable_capitulation_override
+                    and cycle.phase in (CyclePhase.CAPITULATION, CyclePhase.ACCUMULATION)):
+                logger.info(
+                    f"Capitulation override: allowing buy despite "
+                    f"drawdown {drawdown:.1%} > tolerance {tolerance:.1%} "
+                    f"in {cycle.phase.value} phase"
+                )
+                return RiskDecision(
+                    allowed=True,
+                    reason=f"Capitulation override in {cycle.phase.value}: "
+                           f"DCA buying despite drawdown {drawdown:.1%}",
+                    override_active=True,
+                )
 
-    # =========================================================================
-    # TRACKING METHODS
-    # =========================================================================
+            return RiskDecision(
+                allowed=False,
+                reason=f"Drawdown {drawdown:.1%} exceeds phase tolerance "
+                       f"{tolerance:.1%} ({cycle.phase.value})",
+            )
 
-    def _calculate_drawdown(self, portfolio: PortfolioState) -> float:
-        if self.peak_portfolio_value <= 0:
+        return RiskDecision(
+            allowed=True,
+            reason=f"Buy allowed: drawdown {drawdown:.1%} within "
+                   f"tolerance {tolerance:.1%} ({cycle.phase.value})",
+        )
+
+    def _check_sell_risk(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+    ) -> RiskDecision:
+        """Risk checks specific to sell orders."""
+        # Can't sell if no BTC
+        if portfolio.btc_balance <= 0:
+            return RiskDecision(
+                allowed=False,
+                reason="No BTC to sell",
+            )
+
+        return RiskDecision(
+            allowed=True,
+            reason=f"Sell allowed in {cycle.phase.value} phase",
+        )
+
+    def _portfolio_drawdown(self, portfolio: PortfolioState) -> float:
+        """Calculate current drawdown from peak portfolio value."""
+        if self._peak_portfolio_eur <= 0:
             return 0.0
-        current = portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-        dd = (self.peak_portfolio_value - current) / self.peak_portfolio_value
-        return max(0.0, dd)
+        current = portfolio.total_value_eur
+        return max(0.0, 1.0 - current / self._peak_portfolio_eur)
 
-    def record_trade(self, is_buy: bool):
-        self.daily_trade_count += 1
+    def _maybe_reset_daily_count(self) -> None:
+        """Reset daily trade count if the date has changed."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._trade_count_date:
+            if self._daily_trade_count > 0:
+                logger.info(
+                    f"Daily trade count reset (was {self._daily_trade_count})"
+                )
+            self._daily_trade_count = 0
+            self._trade_count_date = today
 
-    def reset_daily_limits(self):
-        self.daily_trade_count = 0
-        self.today_pnl = 0.0
-        logger.info("Daily limits reset")
+    # ─── State persistence ───────────────────────────────────────────────
 
-    def update_peak_value(self, portfolio: PortfolioState):
-        current = portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-        if current > self.peak_portfolio_value:
-            self.peak_portfolio_value = current
+    def _state_path(self) -> Path:
+        return self._persistence.get_path("risk_state.json")
+
+    def _load_state(self) -> None:
+        """Load persisted risk state."""
+        path = self._state_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+            self._daily_trade_count = int(data.get("daily_trade_count", 0))
+            self._trade_count_date = data.get("trade_count_date", "")
+            self._peak_portfolio_eur = float(data.get("peak_portfolio_eur", 0.0))
+            starting = data.get("starting_eur")
+            self._starting_eur = float(starting) if starting is not None else None
+            logger.info(f"Loaded risk state: peak=€{self._peak_portfolio_eur:,.0f}")
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            logger.warning(f"Failed to load risk state: {exc}")
+
+    def _save_state(self) -> None:
+        """Persist risk state to disk."""
+        try:
+            data = {
+                "daily_trade_count": self._daily_trade_count,
+                "trade_count_date": self._trade_count_date,
+                "peak_portfolio_eur": self._peak_portfolio_eur,
+                "starting_eur": self._starting_eur,
+            }
+            self._state_path().write_text(json.dumps(data, indent=2))
+        except OSError as exc:
+            logger.error(f"Failed to save risk state: {exc}")

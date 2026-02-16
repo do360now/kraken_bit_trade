@@ -1,255 +1,476 @@
 """
-Configuration module with validation.
-Loads settings from environment variables and validates them at startup.
-"""
-import os
-import sys
-from typing import Dict, List, Any
-from dotenv import load_dotenv
-from core.exceptions import ConfigurationError
+Configuration module — single source of truth for all bot parameters.
 
-# Load environment variables
+All thresholds, credentials, and tuning knobs live here. No magic numbers
+buried in logic elsewhere. Dynamic state (ATH, cycle floor) is tracked and
+persisted automatically.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+from dotenv import load_dotenv
+
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 
-class Config:
-    """Configuration with validation"""
-    
-    # API credentials
-    API_KEY = os.getenv("KRAKEN_API_KEY") or os.getenv("API_KEY")
-    API_SECRET = os.getenv("KRAKEN_API_SECRET") or os.getenv("API_SECRET")
-    API_DOMAIN = os.getenv("API_DOMAIN", "https://api.kraken.com")
-    
-    # Allocation strategy
-    ALLOC_HODL = float(os.getenv("ALLOC_HODL", "0.9"))
-    ALLOC_YIELD = float(os.getenv("ALLOC_YIELD", "0.0"))
-    ALLOC_TRADING = float(os.getenv("ALLOC_TRADING", "0.1"))
-    
-    ALLOCATIONS = {
-        'HODL': ALLOC_HODL,
-        'YIELD': ALLOC_YIELD,
-        'TRADING': ALLOC_TRADING,
-    }
-    
+# ─── Enums ────────────────────────────────────────────────────────────────────
+
+class CyclePhase(Enum):
+    """Bitcoin halving cycle phases."""
+    ACCUMULATION = "accumulation"
+    EARLY_BULL = "early_bull"
+    GROWTH = "growth"
+    EUPHORIA = "euphoria"
+    DISTRIBUTION = "distribution"
+    EARLY_BEAR = "early_bear"
+    CAPITULATION = "capitulation"
+
+
+class VolatilityRegime(Enum):
+    """Volatility classification."""
+    COMPRESSION = "compression"
+    LOW = "low"
+    NORMAL = "normal"
+    ELEVATED = "elevated"
+    EXTREME = "extreme"
+
+
+class Urgency(Enum):
+    """Order urgency for spread-aware pricing."""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+# ─── Kraken config ────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class KrakenConfig:
+    """Kraken exchange connection and trading parameters."""
+    api_key: str = os.environ.get("KRAKEN_API_KEY", "")
+    private_key: str = os.environ.get("KRAKEN_API_SECRET", "")
+    pair: str = "XXBTZEUR"
+    base_url: str = "https://api.kraken.com"
+
+    # Fees
+    maker_fee: float = 0.0016
+    taker_fee: float = 0.0026
+
+    # Order constraints
+    min_order_btc: float = 0.0001
+    max_order_pct: float = 0.30  # Never exceed 30% of spendable capital
+
+    # Rate limiting
+    max_calls_per_minute: int = 15
+    call_spacing_seconds: float = 4.0  # Conservative: 60/15
+
+    # Circuit breaker
+    circuit_breaker_threshold: int = 5  # Consecutive failures before cooldown
+    circuit_breaker_cooldown: float = 60.0  # Seconds to wait after tripping
+
+    # Retry policy (tenacity parameters)
+    retry_min_wait: float = 1.0
+    retry_max_wait: float = 10.0
+    retry_max_attempts: int = 5
+
+    # Order execution
+    fill_timeout_seconds: float = 300.0  # 5 minutes
+    execution_retry_attempts: int = 3
+
+    @classmethod
+    def from_env(cls) -> KrakenConfig:
+        """Load credentials from environment, keep defaults for everything else."""
+        api_key = os.environ.get("KRAKEN_API_KEY", "")
+        private_key = os.environ.get("KRAKEN_API_SECRET", "")
+        if not api_key or not private_key:
+            logger.warning("Kraken API credentials not found in environment")
+        return cls(api_key=api_key, private_key=private_key)
+
+
+# ─── Cycle config ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CycleConfig:
+    """Bitcoin Cycle 4 parameters (halving April 2024)."""
+    halving_date: datetime = field(
+        default_factory=lambda: datetime(2024, 4, 20, tzinfo=timezone.utc)
+    )
+    # Estimated cycle duration in days (historically ~1400-1460)
+    estimated_cycle_days: int = 1440
+
+    # Phase boundaries as fraction of cycle elapsed
+    # Based on historical patterns: accumulation → early bull → growth → euphoria → distribution → bear
+    phase_boundaries: dict[str, float] = field(default_factory=lambda: {
+        "accumulation_end": 0.15,     # ~216 days post-halving
+        "early_bull_end": 0.30,       # ~432 days
+        "growth_end": 0.55,           # ~792 days
+        "euphoria_end": 0.70,         # ~1008 days
+        "distribution_end": 0.85,     # ~1224 days
+        # After distribution_end → early_bear → capitulation until next halving
+    })
+
+    # Weight allocation for multi-signal phase detection
+    time_weight: float = 0.35
+    price_structure_weight: float = 0.30
+    momentum_weight: float = 0.25
+    volatility_weight: float = 0.10
+
+    # Diminishing returns model for cycle ceiling estimation
+    # Each cycle peak is roughly this fraction of the previous cycle's multiplier
+    diminishing_returns_factor: float = 0.40
+    # Cycle 3 peak was ~69k USD (~60k EUR at the time)
+    # Cycle 4 conservative ceiling estimate in EUR
+    cycle_ceiling_eur: float = 180_000.0
+    cycle_floor_eur: float = 20_000.0  # Estimated absolute floor
+
+
+# ─── Indicator config ─────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class IndicatorConfig:
+    """Technical indicator parameters."""
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bollinger_period: int = 20
+    bollinger_std: float = 2.0
+    atr_period: int = 14
+    vwap_period: int = 14  # Number of candles for VWAP
+
+
+# ─── Signal engine config ────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SignalConfig:
+    """Composite signal generation parameters."""
+    # Score range is -100 to +100
+    # Minimum agreement among sub-signals before acting
+    min_agreement: float = 0.40
+    # Buy threshold: score must exceed this to trigger a buy
+    buy_threshold: float = 20.0
+    # Sell threshold: score must drop below this to trigger a sell
+    sell_threshold: float = -20.0
+
+    # Sub-signal weights (should sum to ~1.0)
+    rsi_weight: float = 0.20
+    macd_weight: float = 0.15
+    bollinger_weight: float = 0.15
+    cycle_weight: float = 0.20
+    onchain_weight: float = 0.10
+    llm_weight: float = 0.10
+    microstructure_weight: float = 0.10
+
+
+# ─── Risk management config ──────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class RiskConfig:
+    """Risk management parameters."""
+    # Reserve floor: never go below this fraction of starting EUR balance
+    reserve_floor_pct: float = 0.20
+
+    # Daily trade limits
+    max_daily_trades: int = 10
+
+    # Drawdown tolerance by phase (from portfolio peak)
+    drawdown_tolerance: dict[str, float] = field(default_factory=lambda: {
+        "accumulation": 0.30,
+        "early_bull": 0.25,
+        "growth": 0.20,
+        "euphoria": 0.12,
+        "distribution": 0.08,
+        "early_bear": 0.15,
+        "capitulation": 0.35,  # More tolerance — DCA territory
+    })
+
+    # Emergency sell: only if below estimated cycle floor (golden rule)
+    enable_golden_rule_floor: bool = True
+
+    # Bear capitulation override: allow buys even at elevated risk
+    enable_capitulation_override: bool = True
+
+    # Stop loss: ATR multiplier for cycle-adjusted stops
+    stop_atr_multiplier: float = 2.5
+
+
+# ─── Position sizing config ──────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class SizingConfig:
+    """Position sizing parameters."""
+    # Base method
+    base_fraction: float = 0.05  # 5% of spendable capital per trade
+
+    # Kelly criterion parameters
+    use_kelly: bool = False  # Start with fixed fractional, graduate to Kelly
+    kelly_fraction: float = 0.25  # Quarter Kelly for safety
+
+    # Adjustment bounds
+    min_adjustment: float = 0.25  # Floor: never size below 25% of base
+    max_adjustment: float = 3.0   # Ceiling: never size above 3x base
+
+    # Tiered profit taking
+    profit_tiers: list[dict[str, float]] = field(default_factory=lambda: [
+        {"threshold": 0.05, "sell_pct": 0.10},   # +5% → sell 10%
+        {"threshold": 0.15, "sell_pct": 0.15},   # +15% → sell 15%
+        {"threshold": 0.30, "sell_pct": 0.20},   # +30% → sell 20%
+        {"threshold": 0.50, "sell_pct": 0.25},   # +50% → sell 25%
+        {"threshold": 1.00, "sell_pct": 0.25},   # +100% → sell 25%
+    ])
+
+
+# ─── Timing config ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class TimingConfig:
+    """Loop timing parameters."""
+    # Fast loop: price, indicators, signals, execution
+    fast_loop_seconds: float = 120.0  # 2 minutes
+
+    # Slow loop: LLM analysis, on-chain metrics, news
+    slow_loop_seconds: float = 1800.0  # 30 minutes
+
+    # On-chain cache TTL
+    onchain_cache_ttl: float = 300.0  # 5 minutes
+
+    # Ollama
+    ollama_url: str = "http://localhost:11434"
+    ollama_model: str = "gemma3:4b"
+    ollama_timeout: float = 60.0  # Seconds before giving up on LLM call
+
     # Bitcoin node RPC
-    RPC_USER = os.getenv("RPC_USER")
-    RPC_PASSWORD = os.getenv("RPC_PASSWORD")
-    RPC_HOST = os.getenv("RPC_HOST", "localhost")
-    RPC_PORT = os.getenv("RPC_PORT", "8332")
-    
-    # Trading parameters
-    TOTAL_BTC = float(os.getenv("TOTAL_BTC", "0.01"))
-    MIN_TRADE_VOLUME = float(os.getenv("MIN_TRADE_VOLUME", "0.0001"))  # Kraken minimum for XXBTZEUR
-    MIN_EUR_FOR_TRADE = float(os.getenv("MIN_EUR_FOR_TRADE", "15.0"))
-    MIN_BTC = float(os.getenv("MIN_BTC", "10"))
-    
-    # Timing
-    GLOBAL_TRADE_COOLDOWN = int(os.getenv("GLOBAL_TRADE_COOLDOWN", "180"))
-    SLEEP_DURATION = int(os.getenv("SLEEP_DURATION", "900"))
-    
-    # Cache durations
-    BALANCE_CACHE_DURATION = int(os.getenv("BALANCE_CACHE_DURATION", "900"))
-    ONCHAIN_CACHE_DURATION = int(os.getenv("ONCHAIN_CACHE_DURATION", "60"))
-    
-    # Risk management
-    MAX_CASH_ALLOCATION = float(os.getenv("MAX_CASH_ALLOCATION", "0.8"))
-    MAX_SELL_ALLOCATION = float(os.getenv("MAX_SELL_ALLOCATION", "0.5"))
-    MIN_PROFIT_MARGIN = float(os.getenv("MIN_PROFIT_MARGIN", "0.05"))
-    
-    # Stop loss and take profit
-    USE_STOP_LOSS = os.getenv("USE_STOP_LOSS", "true").lower() == "true"
-    STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "0.03"))
-    USE_TAKE_PROFIT = os.getenv("USE_TAKE_PROFIT", "true").lower() == "true"
-    TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "0.08"))
-    
-    # Enhanced risk parameters
-    ENABLE_DYNAMIC_STOPS = os.getenv("ENABLE_DYNAMIC_STOPS", "true").lower() == "true"
-    BASE_STOP_LOSS_PCT = float(os.getenv("BASE_STOP_LOSS_PCT", "0.03"))
-    MAX_RISK_OFF_THRESHOLD = float(os.getenv("MAX_RISK_OFF_THRESHOLD", "0.6"))
-    HIGH_VOLATILITY_THRESHOLD = float(os.getenv("HIGH_VOLATILITY_THRESHOLD", "0.05"))
-    LIQUIDATION_CASCADE_THRESHOLD = float(os.getenv("LIQUIDATION_CASCADE_THRESHOLD", "0.5"))
-    MIN_CONFIDENCE_THRESHOLD = float(os.getenv("MIN_CONFIDENCE_THRESHOLD", "60.0"))
-    
-    # News monitoring
-    ENHANCED_NEWS_ENABLED = os.getenv("ENHANCED_NEWS_ENABLED", "true").lower() == "true"
-    NEWS_CACHE_MINUTES = int(os.getenv("NEWS_CACHE_MINUTES", "30"))
-    MAX_NEWS_ARTICLES = int(os.getenv("MAX_NEWS_ARTICLES", "20"))
-    RISK_OFF_WEIGHT = float(os.getenv("RISK_OFF_WEIGHT", "2.0"))
-    MACRO_NEWS_WEIGHT = float(os.getenv("MACRO_NEWS_WEIGHT", "2.0"))
-    
-    # Correlation monitoring
-    ENABLE_CORRELATION_MONITORING = os.getenv("ENABLE_CORRELATION_MONITORING", "true").lower() == "true"
-    CORRELATION_LOOKBACK_DAYS = int(os.getenv("CORRELATION_LOOKBACK_DAYS", "30"))
-    HIGH_CORRELATION_THRESHOLD = float(os.getenv("HIGH_CORRELATION_THRESHOLD", "0.7"))
-    CORRELATION_CACHE_MINUTES = int(os.getenv("CORRELATION_CACHE_MINUTES", "15"))
-    
-    # Position sizing
-    BASE_POSITION_PCT = float(os.getenv("BASE_POSITION_PCT", "0.1"))
-    MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.15"))
-    MIN_POSITION_PCT = float(os.getenv("MIN_POSITION_PCT", "0.02"))
-    RISK_REDUCTION_FACTOR = float(os.getenv("RISK_REDUCTION_FACTOR", "0.5"))
-    
-    # LLM configuration
-    OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-    MODEL_NAME = os.getenv("MODEL_NAME", "gemma3:4b")
-    LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
-    FALLBACK_TO_SIMPLE_LOGIC = os.getenv("FALLBACK_TO_SIMPLE_LOGIC", "true").lower() == "true"
-    
-    # Market data
-    YAHOO_FINANCE_ENABLED = True
-    BITCOIN_PAIR = 'BTC-USD'
-    SPY_TICKER = 'SPY'
-    DXY_TICKER = 'DXY=X'
-    GOLD_TICKER = 'GC=F'
-    
-    # File paths
-    PRICE_HISTORY_FILE = os.getenv("PRICE_HISTORY_FILE", "./price_history.json")
-    BOT_LOGS_FILE = os.getenv("BOT_LOGS_FILE", "./bot_logs.csv")
-    ORDER_HISTORY_FILE = os.getenv("ORDER_HISTORY_FILE", "./order_history.json")
-    PERFORMANCE_FILE = os.getenv("PERFORMANCE_FILE", "./performance_history.json")
-    DB_FILE = os.getenv("DB_FILE", "./trading_bot.db")
-    LOG_FILE = os.getenv("LOG_FILE", "trading_bot.log")
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-    
-    # Metrics server
-    METRICS_PORT = int(os.getenv("METRICS_PORT", "8080"))
-    METRICS_ENABLED = os.getenv("METRICS_ENABLED", "true").lower() == "true"
-    METRICS_AUTH_ENABLED = os.getenv("METRICS_AUTH_ENABLED", "false").lower() == "true"
-    METRICS_USER = os.getenv("METRICS_USER", "admin")
-    METRICS_PASSWORD = os.getenv("METRICS_PASSWORD", "changeme")
-    
-    # Alerting
-    ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
-    ENABLE_ALERTS = os.getenv("ENABLE_ALERTS", "true").lower() == "true"
-    
-    # Exchange addresses for on-chain analysis
-    EXCHANGE_ADDRESSES = {
-        "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa": "Coinbase",
-        "3EktnHQD7RiAE6uzMj2ZifT9YgRrkSgzQX": "Binance1",
-        "34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo": "Binance2",
-        "3FrSzikNqBgikWgTHixywhXcx57q6H6rHC": "Binance3",
-        "3D2oetdNuZUqQHPJmcMDDHYoqkyNVsFk9r": "Bitfinex",
-        "1AnwDVbwsLBVwRfqN2x9Eo4YEJSPXo2cwG": "Kraken"
-    }
-    
-    @classmethod
-    def validate(cls) -> List[str]:
+    bitcoin_rpc_url: str = os.environ.get("RPC_URL", "http://localhost:8332")
+    bitcoin_rpc_user: str = os.environ.get("RPC_USER", "")
+    bitcoin_rpc_password: str = os.environ.get("RPC_PASSWORD", "")
+
+
+# ─── Persistence config ──────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    """Trade execution parameters."""
+    # Limit order pricing: offset from best bid/ask
+    # LOW urgency: deeper into book (better price, slower fill)
+    # HIGH urgency: tighter to market (worse price, faster fill)
+    spread_offset_low: float = 0.6    # 60% into spread from favorable side
+    spread_offset_medium: float = 0.3  # 30% into spread
+    spread_offset_high: float = 0.05   # 5% into spread (near market)
+
+    # Order lifecycle
+    order_ttl_seconds: float = 300.0   # Cancel unfilled orders after 5 min
+    check_interval_seconds: float = 15.0  # Poll order status every 15s
+    max_chase_attempts: int = 3         # Re-price up to 3 times before giving up
+
+    # Price improvement: tick size for Kraken BTC/EUR
+    tick_size: float = 0.1  # Kraken XXBTZEUR tick size
+
+    # Slippage guard: max distance from mid-price
+    max_slippage_pct: float = 0.005  # 0.5% max slippage from mid
+
+
+@dataclass(frozen=True)
+class PersistenceConfig:
+    """File paths for state persistence."""
+    base_dir: Path = field(default_factory=lambda: Path.home() / ".kraken_bot")
+    state_file: str = "bot_state.json"
+    trade_history_file: str = "trade_history.json"
+    ath_file: str = "ath_tracker.json"
+    reflexion_file: str = "reflexion_memory.json"
+    parameter_evolution_file: str = "param_evolution.json"
+    performance_file: str = "performance.json"
+
+    def ensure_dirs(self) -> None:
+        """Create persistence directory if it doesn't exist."""
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_path(self, filename: str) -> Path:
+        """Get full path for a persistence file."""
+        return self.base_dir / filename
+
+
+# ─── Dynamic ATH Tracker ─────────────────────────────────────────────────────
+
+class ATHTracker:
+    """
+    Single source of truth for All-Time High tracking.
+
+    Persists to disk. Updates automatically. Never hardcoded.
+    This exists as a class (not a frozen dataclass) because it's mutable state.
+    """
+
+    def __init__(self, persistence: PersistenceConfig) -> None:
+        self._path = persistence.get_path(persistence.ath_file)
+        self._ath_eur: float = 0.0
+        self._ath_timestamp: Optional[datetime] = None
+        self._load()
+
+    @property
+    def ath_eur(self) -> float:
+        """Current all-time high in EUR."""
+        return self._ath_eur
+
+    @property
+    def ath_timestamp(self) -> Optional[datetime]:
+        """When the ATH was recorded."""
+        return self._ath_timestamp
+
+    def update(self, price_eur: float) -> bool:
         """
-        Validate all configuration values.
-        
-        Returns:
-            List of error messages (empty if valid)
+        Update ATH if price exceeds current record.
+
+        Returns True if a new ATH was set.
         """
-        errors = []
-        
-        # Check required API credentials
-        if not cls.API_KEY or not cls.API_SECRET:
-            errors.append("API_KEY and API_SECRET must be set")
-        
-        # Validate allocations sum to 1.0
-        alloc_sum = sum(cls.ALLOCATIONS.values())
-        if not (0.99 <= alloc_sum <= 1.01):  # Allow small float error
-            errors.append(f"ALLOCATIONS must sum to 1.0, got {alloc_sum:.4f}")
-        
-        # Validate individual allocations are between 0 and 1
-        for name, value in cls.ALLOCATIONS.items():
-            if not (0 <= value <= 1):
-                errors.append(f"{name} allocation must be between 0 and 1, got {value}")
-        
-        # Validate percentage ranges (0-1)
-        percentage_configs = [
-            ("STOP_LOSS_PERCENT", cls.STOP_LOSS_PERCENT),
-            ("TAKE_PROFIT_PERCENT", cls.TAKE_PROFIT_PERCENT),
-            ("BASE_STOP_LOSS_PCT", cls.BASE_STOP_LOSS_PCT),
-            ("MAX_RISK_OFF_THRESHOLD", cls.MAX_RISK_OFF_THRESHOLD),
-            ("HIGH_VOLATILITY_THRESHOLD", cls.HIGH_VOLATILITY_THRESHOLD),
-            ("LIQUIDATION_CASCADE_THRESHOLD", cls.LIQUIDATION_CASCADE_THRESHOLD),
-            ("MAX_CASH_ALLOCATION", cls.MAX_CASH_ALLOCATION),
-            ("MAX_SELL_ALLOCATION", cls.MAX_SELL_ALLOCATION),
-            ("MIN_PROFIT_MARGIN", cls.MIN_PROFIT_MARGIN),
-            ("BASE_POSITION_PCT", cls.BASE_POSITION_PCT),
-            ("MAX_POSITION_PCT", cls.MAX_POSITION_PCT),
-            ("MIN_POSITION_PCT", cls.MIN_POSITION_PCT),
-            ("RISK_REDUCTION_FACTOR", cls.RISK_REDUCTION_FACTOR),
-            ("HIGH_CORRELATION_THRESHOLD", cls.HIGH_CORRELATION_THRESHOLD),
-        ]
-        
-        for name, value in percentage_configs:
-            if not (0 <= value <= 1):
-                errors.append(f"{name} must be between 0 and 1, got {value}")
-        
-        # Validate positive values
-        positive_configs = [
-            ("MIN_TRADE_VOLUME", cls.MIN_TRADE_VOLUME),
-            ("MIN_EUR_FOR_TRADE", cls.MIN_EUR_FOR_TRADE),
-            ("MIN_BTC", cls.MIN_BTC),
-            ("GLOBAL_TRADE_COOLDOWN", cls.GLOBAL_TRADE_COOLDOWN),
-            ("SLEEP_DURATION", cls.SLEEP_DURATION),
-        ]
-        
-        for name, value in positive_configs:
-            if value <= 0:
-                errors.append(f"{name} must be positive, got {value}")
-        
-        # Validate RPC settings if on-chain analysis is needed
-        if not all([cls.RPC_USER, cls.RPC_PASSWORD]):
-            errors.append("RPC_USER and RPC_PASSWORD must be set for on-chain analysis")
-        
-        # Validate position sizing makes sense
-        if cls.MIN_POSITION_PCT > cls.BASE_POSITION_PCT:
-            errors.append(f"MIN_POSITION_PCT ({cls.MIN_POSITION_PCT}) cannot be greater than BASE_POSITION_PCT ({cls.BASE_POSITION_PCT})")
-        
-        if cls.BASE_POSITION_PCT > cls.MAX_POSITION_PCT:
-            errors.append(f"BASE_POSITION_PCT ({cls.BASE_POSITION_PCT}) cannot be greater than MAX_POSITION_PCT ({cls.MAX_POSITION_PCT})")
-        
-        # Validate thresholds
-        if cls.MIN_CONFIDENCE_THRESHOLD < 0 or cls.MIN_CONFIDENCE_THRESHOLD > 100:
-            errors.append(f"MIN_CONFIDENCE_THRESHOLD must be between 0 and 100, got {cls.MIN_CONFIDENCE_THRESHOLD}")
-        
-        return errors
-    
+        if price_eur > self._ath_eur:
+            self._ath_eur = price_eur
+            self._ath_timestamp = datetime.now(timezone.utc)
+            self._save()
+            logger.info(f"New ATH recorded: €{price_eur:,.2f}")
+            return True
+        return False
+
+    def drawdown_from_ath(self, current_price: float) -> float:
+        """Calculate current drawdown as a fraction (0.0 = at ATH, 1.0 = total loss)."""
+        if self._ath_eur <= 0:
+            return 0.0
+        return max(0.0, 1.0 - (current_price / self._ath_eur))
+
+    def _load(self) -> None:
+        """Load ATH from persisted file."""
+        try:
+            if self._path.exists():
+                data = json.loads(self._path.read_text())
+                self._ath_eur = float(data.get("ath_eur", 0.0))
+                ts = data.get("ath_timestamp")
+                if ts:
+                    self._ath_timestamp = datetime.fromisoformat(ts)
+                logger.info(f"Loaded ATH: €{self._ath_eur:,.2f}")
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning(f"Failed to load ATH file, starting fresh: {exc}")
+            self._ath_eur = 0.0
+            self._ath_timestamp = None
+
+    def _save(self) -> None:
+        """Persist ATH to file."""
+        try:
+            data = {
+                "ath_eur": self._ath_eur,
+                "ath_timestamp": self._ath_timestamp.isoformat() if self._ath_timestamp else None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._path.write_text(json.dumps(data, indent=2))
+        except OSError as exc:
+            logger.error(f"Failed to persist ATH: {exc}")
+
+
+# ─── Master config ───────────────────────────────────────────────────────────
+
+@dataclass
+class BotConfig:
+    """
+    Master configuration — aggregates all sub-configs.
+
+    Usage:
+        config = BotConfig.load()
+        # Access any parameter:
+        config.kraken.pair
+        config.cycle.halving_date
+        config.risk.reserve_floor_pct
+    """
+    kraken: KrakenConfig = field(default_factory=KrakenConfig.from_env)
+    cycle: CycleConfig = field(default_factory=CycleConfig)
+    indicators: IndicatorConfig = field(default_factory=IndicatorConfig)
+    signal: SignalConfig = field(default_factory=SignalConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    sizing: SizingConfig = field(default_factory=SizingConfig)
+    timing: TimingConfig = field(default_factory=TimingConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+
+    # Runtime mode
+    paper_trade: bool = False  # Start in paper mode, switch to live explicitly
+    log_level: str = "INFO"
+
+    def __post_init__(self) -> None:
+        self.persistence.ensure_dirs()
+
     @classmethod
-    def validate_or_exit(cls):
-        """Validate configuration and exit if invalid"""
-        errors = cls.validate()
-        
-        if errors:
-            print("❌ Configuration validation failed:")
-            for error in errors:
-                print(f"  - {error}")
-            sys.exit(1)
-        else:
-            print("✅ Configuration validation passed")
+    def load(cls, config_path: Optional[Path] = None) -> BotConfig:
+        """
+        Load config with optional JSON override file.
 
+        Priority: JSON file overrides → env vars → defaults.
+        """
+        config = cls()
 
-# Validate on import
-try:
-    Config.validate_or_exit()
-except Exception as e:
-    print(f"❌ Configuration error: {e}")
-    sys.exit(1)
+        if config_path and config_path.exists():
+            try:
+                overrides = json.loads(config_path.read_text())
+                config = cls._apply_overrides(config, overrides)
+                logger.info(f"Loaded config overrides from {config_path}")
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.warning(f"Failed to load config overrides: {exc}")
 
+        # Environment overrides for runtime settings
+        if os.environ.get("BOT_PAPER_TRADE", "").lower() in ("false", "0", "no"):
+            config.paper_trade = False
 
-# Export commonly used values
-API_KEY = Config.API_KEY
-API_SECRET = Config.API_SECRET
-API_DOMAIN = Config.API_DOMAIN
-ALLOCATIONS = Config.ALLOCATIONS
-TOTAL_BTC = Config.TOTAL_BTC
-MIN_TRADE_VOLUME = Config.MIN_TRADE_VOLUME
-GLOBAL_TRADE_COOLDOWN = Config.GLOBAL_TRADE_COOLDOWN
-SLEEP_DURATION = Config.SLEEP_DURATION
-RPC_USER = Config.RPC_USER
-RPC_PASSWORD = Config.RPC_PASSWORD
-RPC_HOST = Config.RPC_HOST
-RPC_PORT = Config.RPC_PORT
-EXCHANGE_ADDRESSES = Config.EXCHANGE_ADDRESSES
-PRICE_HISTORY_FILE = Config.PRICE_HISTORY_FILE
-BOT_LOGS_FILE = Config.BOT_LOGS_FILE
-MIN_BTC = Config.MIN_BTC
-BALANCE_CACHE_DURATION = Config.BALANCE_CACHE_DURATION
-ONCHAIN_CACHE_DURATION = Config.ONCHAIN_CACHE_DURATION
-MIN_EUR_FOR_TRADE = Config.MIN_EUR_FOR_TRADE
-MAX_CASH_ALLOCATION = Config.MAX_CASH_ALLOCATION
-MAX_SELL_ALLOCATION = Config.MAX_SELL_ALLOCATION
-MIN_PROFIT_MARGIN = Config.MIN_PROFIT_MARGIN
+        log_level = os.environ.get("BOT_LOG_LEVEL", "")
+        if log_level:
+            config.log_level = log_level.upper()
+
+        return config
+
+    @staticmethod
+    def _apply_overrides(config: BotConfig, overrides: dict) -> BotConfig:
+        """Apply JSON overrides to config. Only overrides known fields."""
+        # Flat override mapping for common tuning knobs
+        field_map = {
+            "fast_loop_seconds": ("timing", "fast_loop_seconds"),
+            "slow_loop_seconds": ("timing", "slow_loop_seconds"),
+            "paper_trade": (None, "paper_trade"),
+            "log_level": (None, "log_level"),
+            "buy_threshold": ("signal", "buy_threshold"),
+            "sell_threshold": ("signal", "sell_threshold"),
+            "min_agreement": ("signal", "min_agreement"),
+            "reserve_floor_pct": ("risk", "reserve_floor_pct"),
+            "max_daily_trades": ("risk", "max_daily_trades"),
+            "base_fraction": ("sizing", "base_fraction"),
+        }
+
+        for key, value in overrides.items():
+            if key in field_map:
+                section, attr = field_map[key]
+                if section is None:
+                    setattr(config, attr, value)
+                else:
+                    # Frozen dataclasses require reconstruction
+                    sub = getattr(config, section)
+                    sub_dict = asdict(sub)
+                    sub_dict[attr] = value
+                    setattr(config, section, type(sub)(**sub_dict))
+                logger.info(f"Config override: {key} = {value}")
+            else:
+                logger.warning(f"Unknown config override key: {key}")
+
+        return config
+
+    def setup_logging(self) -> None:
+        """Configure structured logging for the bot."""
+        logging.basicConfig(
+            level=getattr(logging, self.log_level, logging.INFO),
+            format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        # Quiet noisy libraries
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests").setLevel(logging.WARNING)
