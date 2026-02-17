@@ -506,6 +506,41 @@ class TestBookkeeping:
         assert len(history) == 2
 
     @patch("trade_executor.time.sleep")
+    def test_load_trade_history_chronological_order(self, mock_sleep, tmp_path):
+        """Trade history must be in chronological order (oldest first).
+
+        JSONL append-order should naturally preserve chronology, but this
+        explicitly asserts it. A future bulk-import or log rotation must
+        not break ordering, since performance_tracker relies on it for
+        DCA baseline and drawdown tracking.
+        """
+        executor, mock_api, _ = make_executor(tmp_path)
+        mock_api.get_ticker.return_value = make_ticker()
+        mock_api.place_order.return_value = OrderResult(
+            success=True, txid="tx1", status=OrderStatus.PENDING,
+        )
+        mock_api.query_order.return_value = OrderResult(
+            success=True, txid="tx1", status=OrderStatus.FILLED,
+            filled_volume=0.01, filled_price=50000.0, fee=0.80,
+        )
+
+        # Execute 3 trades — timestamps should be monotonically increasing
+        for _ in range(3):
+            executor.execute_buy(make_buy_size())
+
+        config = make_config(tmp_path)
+        executor2 = TradeExecutor(
+            api=mock_api, risk_manager=MagicMock(), config=config,
+        )
+        history = executor2.load_trade_history()
+        assert len(history) == 3
+
+        timestamps = [t["timestamp"] for t in history]
+        assert timestamps == sorted(timestamps), (
+            f"Trade history not in chronological order: {timestamps}"
+        )
+
+    @patch("trade_executor.time.sleep")
     def test_failed_trade_not_logged(self, mock_sleep, tmp_path):
         executor, mock_api, mock_risk = make_executor(tmp_path)
         mock_api.get_ticker.return_value = None

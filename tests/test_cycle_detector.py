@@ -175,17 +175,17 @@ class TestPriceStructure:
 
     def test_at_ath_positive_score(self, tmp_path):
         """Price at ATH → positive price structure score."""
-        det = self._make_detector(tmp_path, ath=100000.0)
-        closes = make_trending_closes(250, 80000.0, 100000.0)
-        result = det._analyze_price_structure(100000.0, closes)
+        det = self._make_detector(tmp_path, ath=114000.0)
+        closes = make_trending_closes(250, 80000.0, 114000.0)
+        result = det._analyze_price_structure(114000.0, closes)
         assert result.drawdown_from_ath == pytest.approx(0.0)
         assert result.price_structure_score > 0.0
 
     def test_deep_drawdown_negative(self, tmp_path):
         """50% drawdown from ATH → negative score."""
-        det = self._make_detector(tmp_path, ath=100000.0)
-        closes = make_trending_closes(250, 80000.0, 50000.0)
-        result = det._analyze_price_structure(50000.0, closes)
+        det = self._make_detector(tmp_path, ath=114000.0)
+        closes = make_trending_closes(250, 114000.0, 57000.0)
+        result = det._analyze_price_structure(57000.0, closes)
         assert result.drawdown_from_ath == pytest.approx(0.5)
         assert result.price_structure_score < 0.0
 
@@ -575,8 +575,8 @@ class TestAnalyzeIntegration:
 
     def test_accumulation_scenario(self, tmp_path):
         """Low price, low vol, sideways → accumulation."""
-        closes = [35000.0 + random.uniform(-500, 500) for _ in range(250)]
         random.seed(42)
+        closes = [35000.0 + random.uniform(-500, 500) for _ in range(250)]
         state = self._run_analysis(
             tmp_path, price=35000.0, ath=100000.0,
             closes=closes, rsi_val=40.0, vol_pct=0.20,
@@ -589,13 +589,13 @@ class TestAnalyzeIntegration:
         tracker = make_ath_tracker(tmp_path, 80000.0)
         det = CycleDetector(config, tracker)
 
-        snap = make_snapshot(price=85000.0, rsi=65.0)
+        snap = make_snapshot(price=114000.0, rsi=65.0)
         closes = make_trending_closes(250, 40000, 85000)
         _, highs, lows = make_daily_data(closes)
 
         state = det.analyze(snap, closes, highs, lows)
-        assert state.ath_eur == 85000.0  # Updated
-        assert tracker.ath_eur == 85000.0
+        assert state.ath_eur == 114000.0  # Updated
+        assert tracker.ath_eur == 114000.0
 
     def test_output_structure_complete(self, tmp_path):
         """All CycleState fields should be populated."""

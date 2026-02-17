@@ -78,6 +78,23 @@ class TradeResult:
     @property
     def success(self) -> bool:
         return self.outcome in (TradeOutcome.FILLED, TradeOutcome.PARTIALLY_FILLED)
+    
+    def to_dict(self) -> dict:
+        """Convert to dict format matching the JSONL trade log schema."""
+        return {
+            "timestamp": time.time(),
+            "side": self.side,
+            "outcome": self.outcome.value,
+            "volume": self.filled_volume,
+            "price": self.filled_price,
+            "eur_value": self.eur_value,
+            "fee": self.fee_eur,
+            "txid": self.txid,
+            "limit_price": self.limit_price,
+            "chase_count": self.chase_count,
+            "elapsed_s": self.elapsed_seconds,
+            "reason": self.reason,
+        }
 
 
 # ─── Trade Executor ──────────────────────────────────────────────────────────

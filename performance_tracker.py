@@ -367,6 +367,9 @@ class PerformanceTracker:
             b["fees"] += t.get("fee_eur", 0.0)
 
         return breakdown
+    
+   
+
 
     # ─── Reporting ───────────────────────────────────────────────────────
 
@@ -508,3 +511,5 @@ class PerformanceTracker:
             self._state_path().write_text(json.dumps(data, indent=2))
         except OSError as exc:
             logger.error(f"Failed to save performance state: {exc}")
+
+ 

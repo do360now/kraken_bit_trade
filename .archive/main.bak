@@ -90,6 +90,7 @@ class Bot:
         # ── Accumulated OHLCV from fast loop ─────────────────────────
         self._fast_candles: list[OHLCCandle] = []
 
+        self._api = KrakenAPI(self._config.kraken)
 
     # ─── Lifecycle ───────────────────────────────────────────────────────
 

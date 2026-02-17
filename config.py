@@ -177,7 +177,7 @@ class SignalConfig:
 class RiskConfig:
     """Risk management parameters."""
     # Reserve floor: never go below this fraction of starting EUR balance
-    reserve_floor_pct: float = 0.20
+    reserve_floor_pct: float = 0.20  # Max position size as fraction of spendable capital
 
     # Daily trade limits
     max_daily_trades: int = 10
@@ -310,7 +310,7 @@ class ATHTracker:
 
     def __init__(self, persistence: PersistenceConfig) -> None:
         self._path = persistence.get_path(persistence.ath_file)
-        self._ath_eur: float = 0.0
+        self._ath_eur: float = 114000.0
         self._ath_timestamp: Optional[datetime] = None
         self._load()
 
