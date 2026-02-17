@@ -587,13 +587,14 @@ class TestCompositeCalculation:
 class TestActionDetermination:
     def test_strong_buy(self, tmp_path):
         engine = make_engine(tmp_path)
-        # Default buy_threshold=20, so strong_buy at 40+
+        # Default buy_threshold=10, so strong_buy at 20+
         action = engine._determine_action(score=50.0, agreement=0.8, data_quality=0.8)
         assert action == Action.STRONG_BUY
 
     def test_buy(self, tmp_path):
         engine = make_engine(tmp_path)
-        action = engine._determine_action(score=25.0, agreement=0.7, data_quality=0.8)
+        # Score 15: above buy_threshold (10) but below strong_buy (20)
+        action = engine._determine_action(score=15.0, agreement=0.7, data_quality=0.8)
         assert action == Action.BUY
 
     def test_hold_neutral_score(self, tmp_path):
@@ -612,7 +613,7 @@ class TestActionDetermination:
         assert action == Action.STRONG_SELL
 
     def test_low_agreement_forces_hold(self, tmp_path):
-        """Below min_agreement (0.4 default) → HOLD regardless of score."""
+        """Below buy_min_agreement (0.35 default) → HOLD regardless of score."""
         engine = make_engine(tmp_path)
         action = engine._determine_action(score=80.0, agreement=0.3, data_quality=0.8)
         assert action == Action.HOLD

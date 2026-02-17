@@ -132,6 +132,21 @@ class SignalEngine:
     def __init__(self, config: BotConfig) -> None:
         self._cfg = config.signal
 
+    def _get_weight(self, signal_name: str, phase_value: str) -> float:
+        """
+        Resolve signal weight: phase-specific override → default.
+
+        For accumulation: RSI/onchain/cycle matter more.
+        For euphoria/distribution: cycle/MACD divergence matter more.
+        """
+        overrides = self._cfg.phase_weight_overrides.get(phase_value, {})
+        weight_key = f"{signal_name}_weight"
+
+        if weight_key in overrides:
+            return overrides[weight_key]
+
+        return getattr(self._cfg, weight_key, 0.1)
+
     def generate(
         self,
         snapshot: TechnicalSnapshot,
@@ -151,28 +166,29 @@ class SignalEngine:
         Returns:
             CompositeSignal with score, agreement, action, and component details.
         """
+        phase_val = cycle.phase.value
         components: list[SubSignal] = []
 
         # ── RSI sub-signal ───────────────────────────────────────────
-        components.append(self._rsi_signal(snapshot, cycle))
+        components.append(self._rsi_signal(snapshot, cycle, phase_val))
 
         # ── MACD sub-signal ──────────────────────────────────────────
-        components.append(self._macd_signal(snapshot))
+        components.append(self._macd_signal(snapshot, phase_val))
 
         # ── Bollinger sub-signal ─────────────────────────────────────
-        components.append(self._bollinger_signal(snapshot))
+        components.append(self._bollinger_signal(snapshot, phase_val))
 
         # ── Cycle sub-signal ─────────────────────────────────────────
-        components.append(self._cycle_signal(cycle))
+        components.append(self._cycle_signal(cycle, phase_val))
 
         # ── On-chain sub-signal ──────────────────────────────────────
-        components.append(self._onchain_signal(onchain))
+        components.append(self._onchain_signal(onchain, phase_val))
 
         # ── LLM sub-signal ───────────────────────────────────────────
-        components.append(self._llm_signal(llm))
+        components.append(self._llm_signal(llm, phase_val))
 
         # ── Microstructure sub-signal ────────────────────────────────
-        components.append(self._microstructure_signal(snapshot))
+        components.append(self._microstructure_signal(snapshot, phase_val))
 
         # ── Composite calculation ────────────────────────────────────
         score, agreement = self._compute_composite(components)
@@ -197,7 +213,7 @@ class SignalEngine:
 
     # ─── Sub-signal generators ───────────────────────────────────────────
 
-    def _rsi_signal(self, snapshot: TechnicalSnapshot, cycle: CycleState) -> SubSignal:
+    def _rsi_signal(self, snapshot: TechnicalSnapshot, cycle: CycleState, phase_val: str = '') -> SubSignal:
         """
         RSI-based signal with cycle-aware interpretation.
 
@@ -263,15 +279,15 @@ class SignalEngine:
         direction = 1 if score > 5 else (-1 if score < -5 else 0)
 
         return SubSignal(
-            name="rsi", score=score, weight=self._cfg.rsi_weight,
+            name="rsi", score=score, weight=self._get_weight("rsi", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
-    def _macd_signal(self, snapshot: TechnicalSnapshot) -> SubSignal:
+    def _macd_signal(self, snapshot: TechnicalSnapshot, phase_val: str = '') -> SubSignal:
         """MACD crossover and histogram momentum signal."""
         if snapshot.macd is None:
             return SubSignal(
-                name="macd", score=0.0, weight=self._cfg.macd_weight,
+                name="macd", score=0.0, weight=self._get_weight("macd", phase_val),
                 direction=0, reason="MACD unavailable",
             )
 
@@ -301,11 +317,11 @@ class SignalEngine:
         direction = 1 if score > 5 else (-1 if score < -5 else 0)
 
         return SubSignal(
-            name="macd", score=score, weight=self._cfg.macd_weight,
+            name="macd", score=score, weight=self._get_weight("macd", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
-    def _bollinger_signal(self, snapshot: TechnicalSnapshot) -> SubSignal:
+    def _bollinger_signal(self, snapshot: TechnicalSnapshot, phase_val: str = '') -> SubSignal:
         """
         Bollinger Bands mean-reversion and squeeze breakout signal.
 
@@ -314,7 +330,7 @@ class SignalEngine:
         """
         if snapshot.bollinger is None:
             return SubSignal(
-                name="bollinger", score=0.0, weight=self._cfg.bollinger_weight,
+                name="bollinger", score=0.0, weight=self._get_weight("bollinger", phase_val),
                 direction=0, reason="Bollinger unavailable",
             )
 
@@ -349,11 +365,11 @@ class SignalEngine:
         direction = 1 if score > 5 else (-1 if score < -5 else 0)
 
         return SubSignal(
-            name="bollinger", score=score, weight=self._cfg.bollinger_weight,
+            name="bollinger", score=score, weight=self._get_weight("bollinger", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
-    def _cycle_signal(self, cycle: CycleState) -> SubSignal:
+    def _cycle_signal(self, cycle: CycleState, phase_val: str = '') -> SubSignal:
         """
         Cycle phase signal — translates the multi-dimensional cycle analysis
         into a trading bias.
@@ -387,11 +403,11 @@ class SignalEngine:
         direction = 1 if score > 5 else (-1 if score < -5 else 0)
 
         return SubSignal(
-            name="cycle", score=score, weight=self._cfg.cycle_weight,
+            name="cycle", score=score, weight=self._get_weight("cycle", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
-    def _onchain_signal(self, onchain: Optional[OnChainSnapshot]) -> SubSignal:
+    def _onchain_signal(self, onchain: Optional[OnChainSnapshot], phase_val: str = '') -> SubSignal:
         """
         On-chain metrics signal.
 
@@ -400,7 +416,7 @@ class SignalEngine:
         """
         if onchain is None:
             return SubSignal(
-                name="onchain", score=0.0, weight=self._cfg.onchain_weight,
+                name="onchain", score=0.0, weight=self._get_weight("onchain", phase_val),
                 direction=0, reason="On-chain data unavailable",
             )
 
@@ -447,11 +463,11 @@ class SignalEngine:
         direction = 1 if score > 5 else (-1 if score < -5 else 0)
 
         return SubSignal(
-            name="onchain", score=score, weight=self._cfg.onchain_weight,
+            name="onchain", score=score, weight=self._get_weight("onchain", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
-    def _llm_signal(self, llm: Optional[LLMContext]) -> SubSignal:
+    def _llm_signal(self, llm: Optional[LLMContext], phase_val: str = '') -> SubSignal:
         """
         LLM-based market analysis signal.
 
@@ -461,13 +477,13 @@ class SignalEngine:
         """
         if llm is None:
             return SubSignal(
-                name="llm", score=0.0, weight=self._cfg.llm_weight,
+                name="llm", score=0.0, weight=self._get_weight("llm", phase_val),
                 direction=0, reason="LLM analysis unavailable",
             )
 
         if llm.stale:
             return SubSignal(
-                name="llm", score=0.0, weight=self._cfg.llm_weight,
+                name="llm", score=0.0, weight=self._get_weight("llm", phase_val),
                 direction=0, reason="LLM analysis stale (>2h old)",
             )
 
@@ -510,11 +526,11 @@ class SignalEngine:
         direction = 1 if score > 5 else (-1 if score < -5 else 0)
 
         return SubSignal(
-            name="llm", score=score, weight=self._cfg.llm_weight,
+            name="llm", score=score, weight=self._get_weight("llm", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
-    def _microstructure_signal(self, snapshot: TechnicalSnapshot) -> SubSignal:
+    def _microstructure_signal(self, snapshot: TechnicalSnapshot, phase_val: str = '') -> SubSignal:
         """
         Market microstructure signal from VWAP relationship and volatility.
 
@@ -523,7 +539,7 @@ class SignalEngine:
         if snapshot.vwap is None:
             return SubSignal(
                 name="microstructure", score=0.0,
-                weight=self._cfg.microstructure_weight,
+                weight=self._get_weight("microstructure", phase_val),
                 direction=0, reason="VWAP unavailable",
             )
 
@@ -556,7 +572,7 @@ class SignalEngine:
 
         return SubSignal(
             name="microstructure", score=score,
-            weight=self._cfg.microstructure_weight,
+            weight=self._get_weight("microstructure", phase_val),
             direction=direction, reason="; ".join(reasons),
         )
 
@@ -607,23 +623,33 @@ class SignalEngine:
 
         Requires minimum agreement before acting. Low data quality
         forces HOLD regardless of score.
+
+        Uses asymmetric agreement thresholds when configured:
+        higher bar for buying (patience), lower for selling (eagerness).
         """
         if data_quality < 0.2:
-            return Action.HOLD
-
-        if agreement < self._cfg.min_agreement:
             return Action.HOLD
 
         buy_thresh = self._cfg.buy_threshold
         sell_thresh = self._cfg.sell_threshold
 
-        if score >= buy_thresh * 2:
-            return Action.STRONG_BUY
-        elif score >= buy_thresh:
+        # Asymmetric agreement: use direction-specific threshold
+        buy_agreement = self._cfg.buy_min_agreement or self._cfg.min_agreement
+        sell_agreement = self._cfg.sell_min_agreement or self._cfg.min_agreement
+
+        if score >= buy_thresh:
+            # Buy direction — apply buy agreement threshold
+            if agreement < buy_agreement:
+                return Action.HOLD
+            if score >= buy_thresh * 2:
+                return Action.STRONG_BUY
             return Action.BUY
-        elif score <= sell_thresh * 2:
-            return Action.STRONG_SELL
         elif score <= sell_thresh:
+            # Sell direction — apply sell agreement threshold
+            if agreement < sell_agreement:
+                return Action.HOLD
+            if score <= sell_thresh * 2:
+                return Action.STRONG_SELL
             return Action.SELL
         else:
             return Action.HOLD

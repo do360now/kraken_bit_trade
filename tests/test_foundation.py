@@ -77,7 +77,7 @@ class TestBotConfig:
             cfg = BotConfig()
             assert cfg.paper_trade is False
             assert cfg.kraken.pair == "XXBTZEUR"
-            assert cfg.risk.reserve_floor_pct == 0.20
+            assert cfg.risk.reserve_floor_pct == 0.12
 
     def test_load_with_overrides(self, tmp_path):
         overrides = {"buy_threshold": 30.0, "paper_trade": False}

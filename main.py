@@ -35,8 +35,8 @@ from indicators import compute_snapshot, TechnicalSnapshot
 from bitcoin_node import BitcoinNode, OnChainSnapshot
 from cycle_detector import CycleDetector, CycleState
 from signal_engine import SignalEngine, CompositeSignal, LLMContext, Action
-from risk_manager import RiskManager, PortfolioState
-from position_sizer import PositionSizer
+from risk_manager import RiskManager, PortfolioState, RiskDecision
+from position_sizer import PositionSizer, BuySize
 from ollama_analyst import OllamaAnalyst
 from trade_executor import TradeExecutor, TradeResult, TradeOutcome
 from performance_tracker import PerformanceTracker
@@ -89,6 +89,9 @@ class Bot:
 
         # ── Accumulated OHLCV from fast loop ─────────────────────────
         self._fast_candles: list[OHLCCandle] = []
+
+        # ── DCA floor tracking ─────────────────────────────────────
+        self._last_buy_time: float = 0.0
 
 
     # ─── Lifecycle ───────────────────────────────────────────────────────
@@ -315,6 +318,11 @@ class Bot:
                         portfolio, cycle, sell_decision.tier,
                     )
                     return
+            else:
+                logger.debug(
+                    "Profit-taking skipped: no avg entry price "
+                    "(no filled buy trades yet)"
+                )
 
         # 8. Evaluate buy signal
         if composite.is_buy and composite.actionable:
@@ -335,7 +343,12 @@ class Bot:
                     )
                     return
 
-        # 9. Log current state (no action taken)
+        # 9. DCA floor: if no buy occurred and it's been too long, force minimum buy
+        if self._should_dca_floor(portfolio, cycle, composite):
+            self._handle_dca_floor_buy(portfolio, cycle, composite)
+            return
+
+        # 10. Log current state (no action taken)
         logger.info(
             f"Loop: price=€{ticker.last:,.0f} "
             f"phase={cycle.phase.value} "
@@ -343,6 +356,83 @@ class Bot:
             f"quality={composite.data_quality:.2f} "
             f"agreement={composite.agreement:.2f}"
         )
+
+    # ─── DCA floor ─────────────────────────────────────────────────────
+
+    def _should_dca_floor(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+        signal: CompositeSignal,
+    ) -> bool:
+        """
+        Check if a DCA floor buy should trigger.
+
+        Triggers when:
+        - DCA floor is enabled in config
+        - It's been longer than dca_floor_interval_hours since last buy
+        - We have spendable EUR above reserve
+        - We're not in distribution/euphoria (don't force-buy near peaks)
+        """
+        cfg = self._config.sizing
+        if not cfg.dca_floor_enabled:
+            return False
+
+        # Don't force buys near cycle peaks
+        if cycle.phase in (CyclePhase.EUPHORIA, CyclePhase.DISTRIBUTION):
+            return False
+
+        # Check time since last buy
+        hours_since_buy = (time.time() - self._last_buy_time) / 3600
+        if hours_since_buy < cfg.dca_floor_interval_hours:
+            return False
+
+        # Check we have spendable EUR
+        reserve = portfolio.starting_eur * self._config.risk.reserve_floor_pct
+        spendable = max(0.0, portfolio.eur_balance - reserve)
+        if spendable <= 0:
+            return False
+
+        return True
+
+    def _handle_dca_floor_buy(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+        signal: CompositeSignal,
+    ) -> None:
+        """Execute a minimum-size DCA floor buy."""
+        cfg = self._config.sizing
+        reserve = portfolio.starting_eur * self._config.risk.reserve_floor_pct
+        spendable = max(0.0, portfolio.eur_balance - reserve)
+
+        eur_amount = spendable * cfg.dca_floor_fraction
+        min_eur = self._config.kraken.min_order_btc * portfolio.btc_price
+        if eur_amount < min_eur:
+            logger.debug(
+                f"DCA floor: €{eur_amount:.0f} below minimum €{min_eur:.0f}"
+            )
+            return
+
+        hours_since = (time.time() - self._last_buy_time) / 3600
+
+        logger.info(
+            f"DCA FLOOR: €{eur_amount:,.0f} "
+            f"({hours_since:.0f}h since last buy, "
+            f"phase={cycle.phase.value})"
+        )
+
+        buy_size = BuySize(
+            eur_amount=eur_amount,
+            btc_amount=eur_amount / portfolio.btc_price,
+            fraction_of_capital=eur_amount / spendable if spendable > 0 else 0.0,
+            adjustments={"dca_floor": 1.0},
+            reason=f"DCA floor: {hours_since:.0f}h without buy",
+        )
+
+        # Use LOW urgency — no rush, just maintaining accumulation
+        risk = RiskDecision(allowed=True, reason="DCA floor override")
+        self._handle_buy(portfolio, cycle, signal, buy_size, risk)
 
     # ─── Slow loop — background data refresh ─────────────────────────────
 
@@ -371,7 +461,9 @@ class Bot:
 
         # 3. LLM analysis (needs a recent snapshot for context)
         ticker = self._api.get_ticker()
-        if ticker is not None:
+        if ticker is None:
+            logger.warning("Slow loop: no ticker — skipping LLM analysis")
+        else:
             candles = self._api.get_ohlc(interval=5)
             if len(candles) >= 30:
                 closes = [c.close for c in candles]
@@ -402,6 +494,11 @@ class Bot:
                     )
                 else:
                     logger.info("LLM: analysis unavailable")
+            else:
+                logger.warning(
+                    f"Slow loop: only {len(candles)} candles — "
+                    f"need 30+ for LLM analysis"
+                )
 
         logger.info("Slow loop: complete")
 
@@ -432,11 +529,13 @@ class Bot:
 
         if self._config.paper_trade:
             logger.info(f"[PAPER] Would buy €{buy_size.eur_amount:,.0f} of BTC")
+            self._last_buy_time = time.time()
             return
 
         result = self._trade_executor.execute_buy(buy_size, urgency)
 
         if result.success:
+            self._last_buy_time = time.time()
             self._performance.record_trade(result, cycle.phase)
             self._performance.record_dca_baseline(
                 buy_size.eur_amount, portfolio.btc_price,

@@ -155,9 +155,9 @@ class SignalConfig:
     """Composite signal generation parameters."""
     # Score range is -100 to +100
     # Minimum agreement among sub-signals before acting
-    min_agreement: float = 0.40
+    min_agreement: float = 0.30
     # Buy threshold: score must exceed this to trigger a buy
-    buy_threshold: float = 20.0
+    buy_threshold: float = 10.0
     # Sell threshold: score must drop below this to trigger a sell
     sell_threshold: float = -20.0
 
@@ -170,6 +170,49 @@ class SignalConfig:
     llm_weight: float = 0.10
     microstructure_weight: float = 0.10
 
+    # ── Asymmetric agreement thresholds ──────────────────────────
+    # For accumulation: be patient buying, eager selling at peaks.
+    # When set, these override min_agreement for the respective direction.
+    # None = use min_agreement for both (backward compatible).
+    buy_min_agreement: Optional[float] = 0.35
+    sell_min_agreement: Optional[float] = 0.35
+
+    # ── Adaptive weights by cycle phase ──────────────────────────
+    # Keys are CyclePhase.value strings. Each dict overrides the
+    # default weights above. Missing keys fall back to defaults.
+    # Rationale:
+    #   Accumulation/capitulation: RSI oversold + on-chain + cycle dominate
+    #   Growth/early_bull: balanced — technicals matter
+    #   Euphoria/distribution: cycle + MACD divergence dominate
+    phase_weight_overrides: dict[str, dict[str, float]] = field(
+        default_factory=lambda: {
+            "accumulation": {
+                "rsi_weight": 0.25, "cycle_weight": 0.25,
+                "onchain_weight": 0.15, "macd_weight": 0.10,
+                "bollinger_weight": 0.10, "llm_weight": 0.10,
+                "microstructure_weight": 0.05,
+            },
+            "capitulation": {
+                "rsi_weight": 0.25, "cycle_weight": 0.25,
+                "onchain_weight": 0.20, "macd_weight": 0.10,
+                "bollinger_weight": 0.05, "llm_weight": 0.10,
+                "microstructure_weight": 0.05,
+            },
+            "euphoria": {
+                "cycle_weight": 0.30, "macd_weight": 0.20,
+                "rsi_weight": 0.15, "bollinger_weight": 0.10,
+                "onchain_weight": 0.10, "llm_weight": 0.10,
+                "microstructure_weight": 0.05,
+            },
+            "distribution": {
+                "cycle_weight": 0.30, "macd_weight": 0.20,
+                "rsi_weight": 0.15, "bollinger_weight": 0.10,
+                "onchain_weight": 0.10, "llm_weight": 0.10,
+                "microstructure_weight": 0.05,
+            },
+        }
+    )
+
 
 # ─── Risk management config ──────────────────────────────────────────────────
 
@@ -177,24 +220,24 @@ class SignalConfig:
 class RiskConfig:
     """Risk management parameters."""
     # Reserve floor: never go below this fraction of starting EUR balance
-    reserve_floor_pct: float = 0.20  # Max position size as fraction of spendable capital
+    reserve_floor_pct: float = 0.12  # Keep 12% of starting EUR as reserve
 
     # Daily trade limits
     max_daily_trades: int = 10
 
     # Drawdown tolerance by phase (from portfolio peak)
     drawdown_tolerance: dict[str, float] = field(default_factory=lambda: {
-        "accumulation": 0.30,
-        "early_bull": 0.25,
-        "growth": 0.20,
-        "euphoria": 0.12,
-        "distribution": 0.08,
-        "early_bear": 0.15,
-        "capitulation": 0.35,  # More tolerance — DCA territory
+        "accumulation": 0.45,
+        "early_bull": 0.35,
+        "growth": 0.30,
+        "euphoria": 0.20,
+        "distribution": 0.15,
+        "early_bear": 0.40,
+        "capitulation": 0.55,  # Max tolerance — prime DCA territory
     })
 
     # Emergency sell: only if below estimated cycle floor (golden rule)
-    enable_golden_rule_floor: bool = True
+    enable_golden_rule_floor: bool = False  # Disabled: emergency sells hurt accumulation
 
     # Bear capitulation override: allow buys even at elevated risk
     enable_capitulation_override: bool = True
@@ -209,7 +252,7 @@ class RiskConfig:
 class SizingConfig:
     """Position sizing parameters."""
     # Base method
-    base_fraction: float = 0.05  # 5% of spendable capital per trade
+    base_fraction: float = 0.035  # 3.5% of spendable capital per trade
 
     # Kelly criterion parameters
     use_kelly: bool = False  # Start with fixed fractional, graduate to Kelly
@@ -219,14 +262,60 @@ class SizingConfig:
     min_adjustment: float = 0.25  # Floor: never size below 25% of base
     max_adjustment: float = 3.0   # Ceiling: never size above 3x base
 
-    # Tiered profit taking
+    # Tiered profit taking (default — used when no phase override matches)
     profit_tiers: list[dict[str, float]] = field(default_factory=lambda: [
-        {"threshold": 0.05, "sell_pct": 0.10},   # +5% → sell 10%
-        {"threshold": 0.15, "sell_pct": 0.15},   # +15% → sell 15%
-        {"threshold": 0.30, "sell_pct": 0.20},   # +30% → sell 20%
-        {"threshold": 0.50, "sell_pct": 0.25},   # +50% → sell 25%
-        {"threshold": 1.00, "sell_pct": 0.25},   # +100% → sell 25%
+        {"threshold": 0.20, "sell_pct": 0.05},   # +20% → sell 5%
+        {"threshold": 0.50, "sell_pct": 0.08},   # +50% → sell 8%
+        {"threshold": 1.00, "sell_pct": 0.12},   # +100% → sell 12%
+        {"threshold": 2.00, "sell_pct": 0.15},   # +200% → sell 15%
     ])
+
+    # ── Value averaging ──────────────────────────────────────────
+    # Buy more when price is below 200-day MA (accumulate at better prices).
+    # Uses distance_from_200d_ma from CycleState.price_structure.
+    # Boost formula: 1 + max_boost * (1 - exp(-sensitivity * distance_below_ma))
+    value_avg_enabled: bool = True
+    value_avg_max_boost: float = 2.0    # Max extra multiplier when deeply below MA
+    value_avg_sensitivity: float = 1.5  # How quickly boost ramps (higher = faster)
+
+    # ── Price acceleration brake (FOMO protection) ───────────────
+    # Reduces buy size when price is running up fast (near Bollinger upper band).
+    # Uses CycleState.volatility_regime + price_structure.position_in_range.
+    acceleration_brake_enabled: bool = True
+    acceleration_brake_factor: float = 0.4  # Reduce to 40% when braking
+
+    # ── Phase-aware profit tiers ─────────────────────────────────
+    # Override default profit_tiers per cycle phase. Missing phases use default.
+    # Growth: hold longer for bigger gains. Euphoria: take profit faster.
+    # Distribution: aggressive exit before bear market.
+    phase_profit_tiers: dict[str, list[dict[str, float]]] = field(
+        default_factory=lambda: {
+            "growth": [
+                {"threshold": 0.30, "sell_pct": 0.03},   # +30% → sell 3%
+                {"threshold": 0.60, "sell_pct": 0.05},   # +60% → sell 5%
+                {"threshold": 1.00, "sell_pct": 0.08},   # +100% → sell 8%
+                {"threshold": 2.00, "sell_pct": 0.12},   # +200% → sell 12%
+            ],
+            "euphoria": [
+                {"threshold": 0.20, "sell_pct": 0.08},   # +20% → sell 8%
+                {"threshold": 0.50, "sell_pct": 0.12},   # +50% → sell 12%
+                {"threshold": 1.00, "sell_pct": 0.18},   # +100% → sell 18%
+            ],
+            "distribution": [
+                {"threshold": 0.15, "sell_pct": 0.10},   # +15% → sell 10%
+                {"threshold": 0.40, "sell_pct": 0.15},   # +40% → sell 15%
+                {"threshold": 0.80, "sell_pct": 0.20},   # +80% → sell 20%
+            ],
+        }
+    )
+
+    # ── DCA floor ────────────────────────────────────────────────
+    # Ensures accumulation happens even during extended HOLD periods.
+    # If no buy occurs within dca_floor_interval_hours, a minimum-size
+    # buy is executed regardless of signal state.
+    dca_floor_enabled: bool = True
+    dca_floor_interval_hours: float = 24.0   # Max hours without a buy
+    dca_floor_fraction: float = 0.015        # 1.5% of spendable for floor buys
 
 
 # ─── Timing config ───────────────────────────────────────────────────────────
@@ -442,9 +531,17 @@ class BotConfig:
             "buy_threshold": ("signal", "buy_threshold"),
             "sell_threshold": ("signal", "sell_threshold"),
             "min_agreement": ("signal", "min_agreement"),
+            "buy_min_agreement": ("signal", "buy_min_agreement"),
+            "sell_min_agreement": ("signal", "sell_min_agreement"),
             "reserve_floor_pct": ("risk", "reserve_floor_pct"),
             "max_daily_trades": ("risk", "max_daily_trades"),
             "base_fraction": ("sizing", "base_fraction"),
+            "dca_floor_enabled": ("sizing", "dca_floor_enabled"),
+            "dca_floor_interval_hours": ("sizing", "dca_floor_interval_hours"),
+            "dca_floor_fraction": ("sizing", "dca_floor_fraction"),
+            "value_avg_enabled": ("sizing", "value_avg_enabled"),
+            "value_avg_max_boost": ("sizing", "value_avg_max_boost"),
+            "acceleration_brake_enabled": ("sizing", "acceleration_brake_enabled"),
         }
 
         for key, value in overrides.items():

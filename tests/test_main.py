@@ -137,10 +137,17 @@ def make_signal(
 
 
 def make_bot(tmp_path: Path, paper: bool = True) -> Bot:
-    """Create a Bot with all external dependencies mocked."""
+    """Create a Bot with all external dependencies mocked.
+
+    IMPORTANT: We do NOT reassign bot._api / bot._bitcoin_node / etc.
+    after construction. The mock objects flow through Bot.__init__
+    naturally via MockClass.return_value. Post-construction reassignment
+    was the pattern that masked the double-instantiation bug — if
+    someone adds a second KrakenAPI() call, the call_count assertion
+    below will catch it immediately.
+    """
     config = make_config(tmp_path, paper=paper)
 
-    # Patch KrakenAPI, BitcoinNode, OllamaAnalyst, PerformanceTracker constructors
     with patch("main.KrakenAPI") as MockAPI, \
          patch("main.BitcoinNode") as MockNode, \
          patch("main.OllamaAnalyst") as MockOllama, \
@@ -162,11 +169,10 @@ def make_bot(tmp_path: Path, paper: bool = True) -> Bot:
 
         bot = Bot(config)
 
-    # Replace internals with our mocks for test access
-    bot._api = mock_api
-    bot._bitcoin_node = mock_node
-    bot._ollama = mock_ollama
-    bot._performance = mock_perf
+        # Guard: each external dependency constructed exactly once
+        assert MockAPI.call_count == 1, (
+            f"KrakenAPI instantiated {MockAPI.call_count} times"
+        )
 
     return bot
 
@@ -228,7 +234,11 @@ class TestFastLoop:
     def test_fast_loop_full_pipeline_hold(self, tmp_path):
         bot = make_bot(tmp_path)
         bot._daily_candles = make_candles(250)
-        bot._performance.get_avg_entry_price.return_value = 0.0
+
+        # _get_avg_entry_price() calls compute_trade_stats().avg_buy_price
+        mock_stats = MagicMock()
+        mock_stats.avg_buy_price = 0.0
+        bot._performance.compute_trade_stats.return_value = mock_stats
 
         bot._api.get_ticker.return_value = make_ticker()
         bot._api.get_ohlc.return_value = make_candles(100)
@@ -244,7 +254,11 @@ class TestFastLoop:
     def test_fast_loop_buy_path_paper(self, tmp_path):
         bot = make_bot(tmp_path, paper=True)
         bot._daily_candles = make_candles(250)
-        bot._performance.get_avg_entry_price.return_value = 0.0
+
+        # _get_avg_entry_price() calls compute_trade_stats().avg_buy_price
+        mock_stats = MagicMock()
+        mock_stats.avg_buy_price = 0.0
+        bot._performance.compute_trade_stats.return_value = mock_stats
 
         buy_signal = make_signal(score=40.0, action=Action.BUY)
 

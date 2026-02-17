@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -247,19 +248,22 @@ class NonceGenerator:
     Monotonic nonce generator for Kraken's API authentication.
 
     Uses microsecond timestamps, guaranteeing strict monotonic increase
-    even under rapid successive calls.
+    even under rapid successive calls. Thread-safe via a lock — critical
+    when the bot's fast and slow loops run concurrently.
     """
 
     def __init__(self) -> None:
         self._last_nonce = 0
+        self._lock = threading.Lock()
 
     def next(self) -> int:
-        """Generate the next nonce value."""
-        nonce = int(time.time() * 1_000_000)
-        if nonce <= self._last_nonce:
-            nonce = self._last_nonce + 1
-        self._last_nonce = nonce
-        return nonce
+        """Generate the next nonce value (thread-safe)."""
+        with self._lock:
+            nonce = int(time.time() * 1_000_000)
+            if nonce <= self._last_nonce:
+                nonce = self._last_nonce + 1
+            self._last_nonce = nonce
+            return nonce
 
 
 # ─── Kraken API Client ───────────────────────────────────────────────────────

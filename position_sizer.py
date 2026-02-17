@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from config import BotConfig, CyclePhase, SizingConfig, PersistenceConfig
+from config import BotConfig, CyclePhase, SizingConfig, PersistenceConfig, VolatilityRegime
 from cycle_detector import CycleState
 from risk_manager import PortfolioState, RiskDecision
 from signal_engine import CompositeSignal
@@ -104,6 +104,8 @@ class PositionSizer:
         - Cycle phase multiplier
         - Drawdown protection
         - Risk override scaling (reduced if capitulation override active)
+        - Value averaging: buy more when price is below 200-day MA
+        - Acceleration brake: reduce size when price is running up fast
         """
         # Spendable capital: EUR minus reserve
         reserve = portfolio.starting_eur * 0.20  # Reserve floor
@@ -141,6 +143,14 @@ class PositionSizer:
         # 5. Risk override: if capitulation override is active, scale down
         override_factor = 0.6 if risk.override_active else 1.0
         adjustments["risk_override"] = override_factor
+
+        # 6. Value averaging: buy more when price is below 200-day MA
+        value_avg_factor = self._value_averaging_factor(cycle)
+        adjustments["value_avg"] = value_avg_factor
+
+        # 7. Acceleration brake: reduce when price is running hot
+        brake_factor = self._acceleration_brake_factor(cycle)
+        adjustments["acceleration_brake"] = brake_factor
 
         # Combine via geometric mean (no anchoring!)
         combined = self._geometric_mean(list(adjustments.values()))
@@ -233,7 +243,9 @@ class PositionSizer:
             )
 
         # Find the highest unhit tier that has been crossed
-        tiers = self._cfg.profit_tiers
+        # Use phase-specific tiers if configured, otherwise defaults
+        phase_val = cycle.phase.value
+        tiers = self._cfg.phase_profit_tiers.get(phase_val, self._cfg.profit_tiers)
         best_tier_idx: Optional[int] = None
 
         for i, tier in enumerate(tiers):
@@ -343,6 +355,80 @@ class PositionSizer:
         if portfolio.starting_eur > 0:
             return portfolio.starting_eur
         return portfolio.total_value_eur
+
+    def _value_averaging_factor(self, cycle: CycleState) -> float:
+        """
+        Value averaging: buy more when price is below 200-day MA.
+
+        Uses distance_from_200d_ma from CycleState.price_structure.
+        Negative distance = below MA = boost buying.
+        Positive distance = above MA = neutral or slight reduction.
+
+        Boost formula: 1 + max_boost * (1 - exp(-sensitivity * distance_below_ma))
+        """
+        if not self._cfg.value_avg_enabled:
+            return 1.0
+
+        price_struct = cycle.price_structure
+        dist = price_struct.distance_from_200d_ma  # +0.15 = 15% above, -0.10 = 10% below
+
+        if dist >= 0:
+            # Above 200d MA: slight reduction when far above
+            # At 50%+ above MA, reduce to 0.7
+            if dist > 0.3:
+                return max(0.7, 1.0 - (dist - 0.3) * 0.75)
+            return 1.0
+        else:
+            # Below 200d MA: boost buying proportionally
+            below = abs(dist)  # e.g. 0.15 for 15% below MA
+            boost = self._cfg.value_avg_max_boost * (
+                1 - math.exp(-self._cfg.value_avg_sensitivity * below)
+            )
+            return 1.0 + boost
+
+    def _acceleration_brake_factor(self, cycle: CycleState) -> float:
+        """
+        FOMO protection: reduce buy size when price is running up fast.
+
+        Triggers when:
+        - Volatility regime is elevated or extreme, AND
+        - Price is near upper Bollinger band (position_in_range > 0.85), OR
+        - Momentum is strongly bullish (chasing a run)
+
+        The idea: if everyone is buying, you don't want to chase.
+        Let the run happen, accumulate on the pullback.
+        """
+        if not self._cfg.acceleration_brake_enabled:
+            return 1.0
+
+        vol_regime = cycle.volatility_regime
+
+        # Only brake in elevated/extreme volatility
+        if vol_regime not in (VolatilityRegime.ELEVATED, VolatilityRegime.EXTREME):
+            return 1.0
+
+        # Check price position
+        pos = getattr(cycle.price_structure, 'position_in_range', 0.5)
+        momentum_score = cycle.momentum_score
+
+        braking = False
+
+        # Price near top of range in high vol = chasing
+        if pos > 0.85:
+            braking = True
+
+        # Strong bullish momentum in high vol = FOMO territory
+        if momentum_score > 0.6 and vol_regime == VolatilityRegime.EXTREME:
+            braking = True
+
+        if braking:
+            logger.debug(
+                f"Acceleration brake: vol={vol_regime.value} "
+                f"pos={pos:.2f} momentum={momentum_score:.2f}"
+            )
+            return self._cfg.acceleration_brake_factor  # e.g. 0.4
+
+        return 1.0
 
     @staticmethod
     def _geometric_mean(factors: list[float]) -> float:

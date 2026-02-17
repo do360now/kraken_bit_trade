@@ -282,8 +282,12 @@ class TestEmergencySell:
         assert decision.allowed is False
 
     def test_golden_rule_blocks_sell_above_floor(self, tmp_path):
-        """Even with extreme drawdown, don't sell if price above floor."""
-        rm = RiskManager(make_config(tmp_path))
+        """When golden rule enabled, don't sell if price above floor."""
+        cfg = BotConfig(
+            persistence=PersistenceConfig(base_dir=tmp_path),
+            risk=RiskConfig(enable_golden_rule_floor=True),
+        )
+        rm = RiskManager(cfg)
         # Set peak
         big = make_portfolio(eur=50000, btc=1.0, btc_price=80000)
         rm.can_trade(make_signal(), big, make_cycle())
@@ -590,9 +594,10 @@ class TestTieredProfitTaking:
 
     def test_first_tier_triggers(self, tmp_path):
         sizer = PositionSizer(make_config(tmp_path))
-        portfolio = make_portfolio(eur=5000, btc=0.5, btc_price=60000)
+        portfolio = make_portfolio(eur=5000, btc=0.5, btc_price=70000)
         cycle = make_cycle(profit_active=True)
-        # Entry at 50000, current 60000 → +20% profit
+        # Entry at 50000, current 70000 → +40% profit
+        # Growth phase tiers: first at +30% → sell 3%
         result = sizer.compute_sell_tiers(portfolio, cycle, avg_entry_price=50000)
         assert result.should_sell is True
         assert result.tier is not None
@@ -615,10 +620,10 @@ class TestTieredProfitTaking:
     def test_tiers_dont_refire(self, tmp_path):
         """Once a tier is hit, it should not fire again."""
         sizer = PositionSizer(make_config(tmp_path))
-        portfolio = make_portfolio(eur=5000, btc=0.5, btc_price=60000)
+        portfolio = make_portfolio(eur=5000, btc=0.5, btc_price=70000)
         cycle = make_cycle(profit_active=True)
 
-        # First evaluation: tier triggers
+        # First evaluation: tier triggers (+40% profit, growth +30% tier fires)
         result1 = sizer.compute_sell_tiers(portfolio, cycle, avg_entry_price=50000)
         assert result1.should_sell is True
         tier_idx = result1.tier.tier_index
@@ -632,9 +637,9 @@ class TestTieredProfitTaking:
 
     def test_tiers_reset_on_phase_change(self, tmp_path):
         sizer = PositionSizer(make_config(tmp_path))
-        portfolio = make_portfolio(eur=5000, btc=0.5, btc_price=60000)
+        portfolio = make_portfolio(eur=5000, btc=0.5, btc_price=70000)
 
-        # Hit a tier in GROWTH
+        # Hit a tier in GROWTH (+40% profit, growth +30% tier fires)
         cycle_growth = make_cycle(phase=CyclePhase.GROWTH, profit_active=True)
         result = sizer.compute_sell_tiers(portfolio, cycle_growth, avg_entry_price=50000)
         if result.should_sell:
