@@ -343,7 +343,7 @@ class TimingConfig:
     ollama_timeout: float = 60.0  # Seconds before giving up on LLM call
 
     # Bitcoin node RPC
-    bitcoin_rpc_url: str = os.environ.get("RPC_URL", "http://localhost:8332")
+    bitcoin_rpc_url: str = os.environ.get("RPC_URL", "http://192.168.1.78:8332")
     bitcoin_rpc_user: str = os.environ.get("RPC_USER", "")
     bitcoin_rpc_password: str = os.environ.get("RPC_PASSWORD", "")
 

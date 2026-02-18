@@ -14,11 +14,15 @@ Design:
 """
 from __future__ import annotations
 
+import os
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import requests
 
@@ -122,6 +126,7 @@ class OnChainSnapshot:
     network: NetworkInfo
     large_txs: list[LargeTransaction]
     timestamp: float
+    available: bool = True  # True if node is reachable
 
     @property
     def whale_activity(self) -> bool:
@@ -222,13 +227,20 @@ class BitcoinNode:
 
     def __init__(
         self,
-        rpc_url: str = "http://127.0.0.1:8332",
-        rpc_user: str = "",
-        rpc_password: str = "",
+        rpc_url: str = os.environ.get("RPC_URL", "http://192.168.1.78:8332"),
+        rpc_user: str = os.environ.get("RPC_USER", ""),
+        rpc_password: str = os.environ.get("RPC_PASSWORD", ""),
         cache_ttl: float = 300.0,
         timeout: float = 30.0,
     ) -> None:
+        # Validate URL - reject quotes which indicate f-string bugs
+        if '"' in rpc_url or "'" in rpc_url:
+            raise ValueError(f"Invalid RPC URL (contains quotes): {rpc_url}")
+        if not rpc_url.startswith("http://") and not rpc_url.startswith("https://"):
+            raise ValueError(f"Invalid RPC URL (must start with http:// or https://): {rpc_url}")
+
         self._rpc_url = rpc_url
+        logger.info(f"BitcoinNode initialized with RPC URL: {rpc_url}")
         self._auth = (rpc_user, rpc_password) if rpc_user else None
         self._timeout = timeout
         self._cache = _TTLCache(ttl=cache_ttl)
@@ -238,8 +250,11 @@ class BitcoinNode:
 
     @property
     def is_available(self) -> bool:
-        """Whether the node was reachable on the last attempt."""
-        return self._available is True
+        """Whether the node was reachable on the last attempt.
+
+        Returns True if we haven't confirmed it's down yet (None = untested).
+        """
+        return self._available is not False
 
     # ─── Public interface ────────────────────────────────────────────────
 
@@ -471,13 +486,41 @@ class BitcoinNode:
         This is the main entry point — call this from the slow loop.
         Individual components that fail return neutral defaults.
         """
+        error_occurred = False
+        try:
+            mempool = self.get_mempool_info()
+        except Exception:
+            mempool = _NEUTRAL_MEMPOOL
+            error_occurred = True
+        try:
+            fees = self.get_fee_estimates()
+        except Exception:
+            fees = _NEUTRAL_FEES
+            error_occurred = True
+        try:
+            blocks = self.get_block_info()
+        except Exception:
+            blocks = _NEUTRAL_BLOCKS
+            error_occurred = True
+        try:
+            network = self.get_network_info()
+        except Exception:
+            network = _NEUTRAL_NETWORK
+            error_occurred = True
+        try:
+            large_txs = self.get_large_transactions()
+        except Exception:
+            large_txs = []
+            error_occurred = True
+
         return OnChainSnapshot(
-            mempool=self.get_mempool_info(),
-            fees=self.get_fee_estimates(),
-            blocks=self.get_block_info(),
-            network=self.get_network_info(),
-            large_txs=self.get_large_transactions(),
+            mempool=mempool,
+            fees=fees,
+            blocks=blocks,
+            network=network,
+            large_txs=large_txs,
             timestamp=time.time(),
+            available=not error_occurred and self._available is not False,
         )
 
     # ─── Internal RPC mechanics ──────────────────────────────────────────

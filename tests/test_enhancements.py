@@ -558,8 +558,8 @@ class TestDCAFloor:
         """DCA floor triggers after interval elapses."""
         bot = self._make_bot(tmp_path)
 
-        # Set last buy to 25 hours ago
-        bot._last_buy_time = time.time() - (25 * 3600)
+        # Set last buy to 25 hours ago via risk_manager
+        bot._risk_manager._last_buy_time = time.time() - (25 * 3600)
 
         portfolio = make_portfolio(eur=10000, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.GROWTH)
@@ -571,8 +571,8 @@ class TestDCAFloor:
         """DCA floor doesn't trigger if bought recently."""
         bot = self._make_bot(tmp_path)
 
-        # Set last buy to 12 hours ago
-        bot._last_buy_time = time.time() - (12 * 3600)
+        # Set last buy to 12 hours ago via risk_manager
+        bot._risk_manager._last_buy_time = time.time() - (12 * 3600)
 
         portfolio = make_portfolio(eur=10000, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.GROWTH)
@@ -583,7 +583,7 @@ class TestDCAFloor:
     def test_should_not_dca_floor_in_euphoria(self, tmp_path):
         """DCA floor blocked during euphoria (don't force-buy near peaks)."""
         bot = self._make_bot(tmp_path)
-        bot._last_buy_time = time.time() - (48 * 3600)
+        bot._risk_manager._last_buy_time = time.time() - (48 * 3600)
 
         portfolio = make_portfolio(eur=10000, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.EUPHORIA)
@@ -594,7 +594,7 @@ class TestDCAFloor:
     def test_should_not_dca_floor_in_distribution(self, tmp_path):
         """DCA floor blocked during distribution."""
         bot = self._make_bot(tmp_path)
-        bot._last_buy_time = time.time() - (48 * 3600)
+        bot._risk_manager._last_buy_time = time.time() - (48 * 3600)
 
         portfolio = make_portfolio(eur=10000, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.DISTRIBUTION)
@@ -605,7 +605,7 @@ class TestDCAFloor:
     def test_should_not_dca_floor_no_spendable(self, tmp_path):
         """DCA floor blocked when EUR balance is zero."""
         bot = self._make_bot(tmp_path)
-        bot._last_buy_time = time.time() - (48 * 3600)
+        bot._risk_manager._last_buy_time = time.time() - (48 * 3600)
 
         # No EUR at all → nothing to spend
         portfolio = make_portfolio(eur=0, btc=0.5, price=50000.0)
@@ -636,7 +636,7 @@ class TestDCAFloor:
 
             bot = Bot(config)
 
-        bot._last_buy_time = time.time() - (48 * 3600)
+        bot._risk_manager._last_buy_time = time.time() - (48 * 3600)
         portfolio = make_portfolio(eur=10000, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.ACCUMULATION)
         signal = make_signal()
@@ -646,7 +646,7 @@ class TestDCAFloor:
     def test_dca_floor_in_capitulation_allowed(self, tmp_path):
         """DCA floor IS allowed during capitulation (accumulation territory)."""
         bot = self._make_bot(tmp_path)
-        bot._last_buy_time = time.time() - (48 * 3600)
+        bot._risk_manager._last_buy_time = time.time() - (48 * 3600)
 
         portfolio = make_portfolio(eur=10000, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.CAPITULATION)
@@ -657,7 +657,7 @@ class TestDCAFloor:
     def test_handle_buy_updates_last_buy_time(self, tmp_path):
         """_handle_buy sets _last_buy_time on execution."""
         bot = self._make_bot(tmp_path, paper=True)
-        assert bot._last_buy_time == 0.0
+        assert bot._risk_manager._last_buy_time == 0.0
 
         portfolio = make_portfolio()
         cycle = make_cycle()
@@ -671,7 +671,7 @@ class TestDCAFloor:
 
         bot._handle_buy(portfolio, cycle, signal, buy_size, risk)
 
-        assert bot._last_buy_time > 0
+        assert bot._risk_manager._last_buy_time > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════

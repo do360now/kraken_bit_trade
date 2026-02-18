@@ -112,6 +112,7 @@ class RiskManager:
         self._trade_count_date: str = ""  # ISO date for reset tracking
         self._peak_portfolio_eur: float = 0.0
         self._starting_eur: Optional[float] = None
+        self._last_buy_time: float = 0.0  # Timestamp of last buy for DCA floor
 
         self._load_state()
 
@@ -265,6 +266,17 @@ class RiskManager:
         self._save_state()
         logger.info(f"Trade recorded. Daily count: {self._daily_trade_count}")
 
+    def record_buy(self) -> None:
+        """Record that a buy was executed. Updates last_buy_time for DCA floor."""
+        self._last_buy_time = time.time()
+        self._save_state()
+        logger.info(f"Buy recorded. Last buy time updated.")
+
+    @property
+    def last_buy_time(self) -> float:
+        """Timestamp of last buy for DCA floor tracking."""
+        return self._last_buy_time
+
     def get_drawdown(self, portfolio: PortfolioState) -> float:
         """Current portfolio drawdown from peak (0.0–1.0)."""
         return self._portfolio_drawdown(portfolio)
@@ -375,6 +387,7 @@ class RiskManager:
             self._peak_portfolio_eur = float(data.get("peak_portfolio_eur", 0.0))
             starting = data.get("starting_eur")
             self._starting_eur = float(starting) if starting is not None else None
+            self._last_buy_time = float(data.get("last_buy_time", 0.0))
             logger.info(f"Loaded risk state: peak=€{self._peak_portfolio_eur:,.0f}")
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             logger.warning(f"Failed to load risk state: {exc}")
@@ -387,6 +400,7 @@ class RiskManager:
                 "trade_count_date": self._trade_count_date,
                 "peak_portfolio_eur": self._peak_portfolio_eur,
                 "starting_eur": self._starting_eur,
+                "last_buy_time": self._last_buy_time,
             }
             self._state_path().write_text(json.dumps(data, indent=2))
         except OSError as exc:

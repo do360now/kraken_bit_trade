@@ -90,8 +90,7 @@ class Bot:
         # ── Accumulated OHLCV from fast loop ─────────────────────────
         self._fast_candles: list[OHLCCandle] = []
 
-        # ── DCA floor tracking ─────────────────────────────────────
-        self._last_buy_time: float = 0.0
+        # ── DCA floor tracking via risk_manager ───────────────────────
 
 
     # ─── Lifecycle ───────────────────────────────────────────────────────
@@ -384,7 +383,7 @@ class Bot:
             return False
 
         # Check time since last buy
-        hours_since_buy = (time.time() - self._last_buy_time) / 3600
+        hours_since_buy = (time.time() - self._risk_manager.last_buy_time) / 3600
         if hours_since_buy < cfg.dca_floor_interval_hours:
             return False
 
@@ -429,7 +428,7 @@ class Bot:
                 )
                 return False
 
-        hours_since = (time.time() - self._last_buy_time) / 3600
+        hours_since = (time.time() - self._risk_manager.last_buy_time) / 3600
 
         logger.info(
             f"DCA FLOOR: €{eur_amount:,.0f} "
@@ -439,7 +438,8 @@ class Bot:
 
         buy_size = BuySize(
             eur_amount=eur_amount,
-            btc_amount=eur_amount / portfolio.btc_price,
+            # Ensure at least min_order_btc to avoid "below minimum" errors
+            btc_amount=max(eur_amount / portfolio.btc_price, self._config.kraken.min_order_btc),
             fraction_of_capital=eur_amount / spendable if spendable > 0 else 0.0,
             adjustments={"dca_floor": 1.0},
             reason=f"DCA floor: {hours_since:.0f}h without buy",
@@ -545,13 +545,13 @@ class Bot:
 
         if self._config.paper_trade:
             logger.info(f"[PAPER] Would buy €{buy_size.eur_amount:,.0f} of BTC")
-            self._last_buy_time = time.time()
+            self._risk_manager.record_buy()
             return
 
         result = self._trade_executor.execute_buy(buy_size, urgency)
 
         if result.success:
-            self._last_buy_time = time.time()
+            self._risk_manager.record_buy()
             self._performance.record_trade(result, cycle.phase)
             self._performance.record_dca_baseline(
                 buy_size.eur_amount, portfolio.btc_price,
