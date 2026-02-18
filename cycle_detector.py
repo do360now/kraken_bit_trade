@@ -658,20 +658,49 @@ class CycleDetector:
         candidates.sort(key=lambda x: x[1], reverse=True)
         best_phase, best_fit = candidates[0]
 
-        # Hysteresis: require a minimum fit advantage to transition
+        # ── Phase stability: prevent rapid flapping ───────────────────
+        # Phases represent multi-week market regimes, not minute-level
+        # fluctuations. Three guards prevent spurious transitions:
+        #
+        # 1. Minimum dwell time: must stay in current phase for N cycles
+        # 2. Confidence floor: new phase must meet minimum confidence
+        # 3. Fit advantage: new phase must convincingly beat current
+
         if (self._last_phase is not None
-                and best_phase != self._last_phase
-                and self._phase_hold_cycles < 10):
-            # Find the current phase's fit score
-            current_fit = 0.0
-            for phase, fit in candidates:
-                if phase == self._last_phase:
-                    current_fit = fit
-                    break
-            # Only transition if new phase is significantly better
-            if best_fit - current_fit < 0.15:
+                and best_phase != self._last_phase):
+
+            min_dwell = self._cycle_cfg.min_phase_dwell_cycles
+            min_confidence = self._cycle_cfg.phase_transition_confidence
+            base_advantage = self._cycle_cfg.phase_transition_advantage
+
+            # Guard 1: Minimum dwell time
+            if self._phase_hold_cycles < min_dwell:
                 best_phase = self._last_phase
-                best_fit = current_fit
+                # Recalculate best_fit for the held phase
+                for phase, fit in candidates:
+                    if phase == self._last_phase:
+                        best_fit = fit
+                        break
+            else:
+                # Guard 2 & 3: Confidence and advantage checks
+                current_fit = 0.0
+                for phase, fit in candidates:
+                    if phase == self._last_phase:
+                        current_fit = fit
+                        break
+
+                # Calculate confidence for candidate phase
+                second_fit = candidates[1][1] if len(candidates) > 1 else 0.0
+                candidate_confidence = min(1.0, max(0.1, best_fit - second_fit + 0.3))
+
+                # Reject if confidence too low
+                if candidate_confidence < min_confidence:
+                    best_phase = self._last_phase
+                    best_fit = current_fit
+                # Reject if advantage too small
+                elif best_fit - current_fit < base_advantage:
+                    best_phase = self._last_phase
+                    best_fit = current_fit
 
         # Confidence: how much better is the best fit than the second best
         second_fit = candidates[1][1] if len(candidates) > 1 else 0.0

@@ -193,7 +193,7 @@ That's what I think."""
         """
         result = analyst._parse_response(raw)
         assert result is not None
-        assert result.regime == "markdown"
+        assert result.regime == "decline"  # "markdown" → "decline" alias
         assert result.sentiment == pytest.approx(-0.7)
         assert result.risk_level == "extreme"
 
@@ -485,4 +485,4 @@ class TestEdgeCases:
         result = analyst.analyze(make_snapshot(), make_cycle())
         assert result is not None
         # Should get the first valid parse (either via full text or regex)
-        assert result.regime in ("markup", "markdown")
+        assert result.regime in ("markup", "decline")

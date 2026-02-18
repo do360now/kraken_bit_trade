@@ -6,43 +6,40 @@
   Starting:        €10,000 + 0.0000 BTC
 
 ─── PORTFOLIO ───────────────────────────────────────────────
-  Final EUR:       €1,925
-  Final BTC:       0.10390251
-  Final value:     €7,906
-  Total return:    -20.9%
-  Max drawdown:    37.4% (on 2026-02-05)
+  Final EUR:       €4,031
+  Final BTC:       0.08190678
+  Final value:     €8,746
+  Total return:    -12.5%
+  Max drawdown:    18.3% (on 2026-02-05)
 
 ─── ACCUMULATION ────────────────────────────────────────────
-  BTC bought:      0.13476764
-  BTC sold:        0.03086513
-  Net accumulated: 0.10390251
-  Avg buy price:   €82,250
-  Total fees:      €22.56
+  BTC bought:      0.08248970
+  BTC sold:        0.00058292
+  Net accumulated: 0.08190678
+  Avg buy price:   €73,047
+  Total fees:      €9.73
 
 ─── TRADES ──────────────────────────────────────────────────
-  Total:           234
-  Buys:            228
-  Sells:           6
+  Total:           68
+  Buys:            65
+  Sells:           3
   Emergency sells: 0
-  DCA floor buys:  190
+  DCA floor buys:  55
 
 ─── vs DCA BASELINE ─────────────────────────────────────────
   DCA BTC:         0.06347416
   DCA value:       €8,096
   DCA avg price:   €87,562
   DCA fees:        €8.89
-  BTC advantage:   +63.7%
-  Value advantage: -2.3%
+  BTC advantage:   +29.0%
+  Value advantage: +8.0%
 
 ─── PHASE BREAKDOWN ─────────────────────────────────────────
-  accumulation           44 trades  +0.02365355 BTC
-  capitulation           10 trades  +0.00210705 BTC
-  distribution            3 trades  -0.02408605 BTC
-  early_bear             64 trades  +0.04536638 BTC
-  early_bull            109 trades  +0.06176933 BTC
-  euphoria                3 trades  -0.00677908 BTC
+  accumulation           31 trades  +0.04759896 BTC
+  distribution            3 trades  -0.00058292 BTC
+  early_bull             33 trades  +0.03301941 BTC
   growth                  1 trades  +0.00187133 BTC
 
 ══════════════════════════════════════════════════════════════════════
-  VERDICT: Bot BEATS DCA by 63.7% in BTC accumulated
+  VERDICT: Bot BEATS DCA by 29.0% in BTC accumulated
 ══════════════════════════════════════════════════════════════════════

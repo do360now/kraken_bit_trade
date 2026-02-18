@@ -484,22 +484,30 @@ class TestHysteresis:
         assert phase == CyclePhase.GROWTH
 
     def test_strong_signal_overrides_hysteresis(self, tmp_path):
-        """Very strong signals should override hysteresis."""
+        """Strong signals transition AFTER minimum dwell time is met."""
         config = make_config(tmp_path)
         ath = make_ath_tracker(tmp_path, 100000.0)
         det = CycleDetector(config, ath)
 
         det._last_phase = CyclePhase.GROWTH
-        det._phase_hold_cycles = 5
 
-        # Very strong bearish signals
-        phase, _ = det._determine_phase(
+        # Before dwell time: even very strong bearish signals are blocked
+        det._phase_hold_cycles = 5
+        phase_early, _ = det._determine_phase(
             composite=-0.8, time_score=-0.6, price_score=-0.9,
             momentum_score=-0.8, vol_regime=VolatilityRegime.EXTREME,
             cycle_progress=0.85,
         )
-        # Should transition despite hysteresis
-        assert phase != CyclePhase.GROWTH
+        assert phase_early == CyclePhase.GROWTH  # Blocked by dwell time
+
+        # After dwell time: strong signals DO transition
+        det._phase_hold_cycles = 35  # Past min_phase_dwell_cycles (30)
+        phase_late, _ = det._determine_phase(
+            composite=-0.8, time_score=-0.6, price_score=-0.9,
+            momentum_score=-0.8, vol_regime=VolatilityRegime.EXTREME,
+            cycle_progress=0.85,
+        )
+        assert phase_late != CyclePhase.GROWTH  # Now allowed
 
 
 # ─── Downstream adjustments tests ───────────────────────────────────────────

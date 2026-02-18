@@ -300,8 +300,12 @@ class TestEmergencySell:
         assert "golden rule" in decision.reason.lower()
 
     def test_emergency_fires_near_floor(self, tmp_path):
-        """Extreme drawdown + near cycle floor → emergency sell."""
-        rm = RiskManager(make_config(tmp_path))
+        """Extreme drawdown + near cycle floor → emergency sell (when enabled)."""
+        cfg = BotConfig(
+            persistence=PersistenceConfig(base_dir=tmp_path),
+            risk=RiskConfig(enable_golden_rule_floor=True),
+        )
+        rm = RiskManager(cfg)
         big = make_portfolio(eur=50000, btc=1.0, btc_price=80000)
         rm.can_trade(make_signal(), big, make_cycle())
 
@@ -515,8 +519,8 @@ class TestBuySizeComputation:
     def test_no_spendable_eur(self, tmp_path):
         sizer = PositionSizer(make_config(tmp_path))
         signal = make_signal()
-        # EUR below reserve floor (20% of starting)
-        portfolio = make_portfolio(eur=100, btc=0, btc_price=50000, starting_eur=10000)
+        # Zero EUR → nothing to spend after reserve
+        portfolio = make_portfolio(eur=0, btc=0, btc_price=50000, starting_eur=10000)
         cycle = make_cycle()
         risk = RiskDecision(allowed=True, reason="ok")
 

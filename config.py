@@ -132,6 +132,11 @@ class CycleConfig:
     cycle_ceiling_eur: float = 180_000.0
     cycle_floor_eur: float = 20_000.0  # Estimated absolute floor
 
+    # Phase stability: prevent rapid phase flapping
+    min_phase_dwell_cycles: int = 30     # Minimum cycles before allowing transition (~60 min at 2-min loop)
+    phase_transition_confidence: float = 0.40  # Minimum confidence to accept a new phase
+    phase_transition_advantage: float = 0.20   # New phase must beat current by this margin
+
 
 # ─── Indicator config ─────────────────────────────────────────────────────────
 
@@ -542,6 +547,9 @@ class BotConfig:
             "value_avg_enabled": ("sizing", "value_avg_enabled"),
             "value_avg_max_boost": ("sizing", "value_avg_max_boost"),
             "acceleration_brake_enabled": ("sizing", "acceleration_brake_enabled"),
+            "min_phase_dwell_cycles": ("cycle", "min_phase_dwell_cycles"),
+            "phase_transition_confidence": ("cycle", "phase_transition_confidence"),
+            "phase_transition_advantage": ("cycle", "phase_transition_advantage"),
         }
 
         for key, value in overrides.items():

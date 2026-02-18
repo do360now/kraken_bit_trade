@@ -603,12 +603,12 @@ class TestDCAFloor:
         assert bot._should_dca_floor(portfolio, cycle, signal) is False
 
     def test_should_not_dca_floor_no_spendable(self, tmp_path):
-        """DCA floor blocked when EUR below reserve."""
+        """DCA floor blocked when EUR balance is zero."""
         bot = self._make_bot(tmp_path)
         bot._last_buy_time = time.time() - (48 * 3600)
 
-        # Only €500 EUR, starting at €35k → reserve = €7k → no spendable
-        portfolio = make_portfolio(eur=500, btc=0.5, price=50000.0)
+        # No EUR at all → nothing to spend
+        portfolio = make_portfolio(eur=0, btc=0.5, price=50000.0)
         cycle = make_cycle(phase=CyclePhase.GROWTH)
         signal = make_signal()
 

@@ -454,10 +454,16 @@ class BacktestEngine:
                     and hours_since >= dca_floor_cfg.dca_floor_interval_hours
                     and cycle.phase not in (CyclePhase.EUPHORIA, CyclePhase.DISTRIBUTION)
                 ):
-                    reserve = self._cfg.starting_eur * bot_cfg.risk.reserve_floor_pct
+                    # Reserve based on current EUR balance, not starting capital
+                    # (matches live fix: prevents death spiral)
+                    reserve = eur * bot_cfg.risk.reserve_floor_pct
                     spendable = max(0.0, eur - reserve)
                     floor_eur = spendable * dca_floor_cfg.dca_floor_fraction
                     min_eur = bot_cfg.kraken.min_order_btc * price
+
+                    # Bump to minimum if below but spendable allows
+                    if floor_eur < min_eur and spendable >= min_eur:
+                        floor_eur = min_eur
 
                     if floor_eur >= min_eur and floor_eur <= eur:
                         buy_btc, fee = self._simulate_buy(floor_eur, price)

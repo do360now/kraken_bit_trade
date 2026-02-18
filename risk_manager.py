@@ -175,15 +175,12 @@ class RiskManager:
         breakdown rather than normal volatility.
         """
         if not self._cfg.enable_golden_rule_floor:
-            # Golden rule disabled — use simple drawdown check
-            drawdown = self._portfolio_drawdown(portfolio)
-            if drawdown > cycle.drawdown_tolerance * 1.5:
-                return RiskDecision(
-                    allowed=True,
-                    reason=f"Emergency: drawdown {drawdown:.1%} exceeds "
-                           f"1.5x tolerance ({cycle.drawdown_tolerance * 1.5:.1%})",
-                )
-            return RiskDecision(allowed=False, reason="No emergency condition")
+            # Emergency sells fully disabled — backtest-proven that selling
+            # during crashes destroys accumulation
+            return RiskDecision(
+                allowed=False,
+                reason="Emergency sells disabled (enable_golden_rule_floor=False)",
+            )
 
         # Golden rule floor protection
         floor = cycle.price_structure.position_in_range

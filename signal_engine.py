@@ -513,7 +513,7 @@ class SignalEngine:
 
         # Regime alignment
         bullish_regimes = {"accumulation", "markup"}
-        bearish_regimes = {"distribution", "markdown", "capitulation"}
+        bearish_regimes = {"distribution", "decline", "capitulation"}
         if llm.regime in bullish_regimes:
             score += 10.0
             reasons.append(f"LLM regime: {llm.regime} (bullish)")

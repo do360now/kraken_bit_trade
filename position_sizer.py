@@ -79,6 +79,7 @@ class PositionSizer:
 
     def __init__(self, config: BotConfig) -> None:
         self._cfg = config.sizing
+        self._cfg_risk = config.risk
         self._kraken_cfg = config.kraken
         self._persistence = config.persistence
         self._hit_tiers: set[int] = set()  # Tiers already triggered this cycle
@@ -107,8 +108,11 @@ class PositionSizer:
         - Value averaging: buy more when price is below 200-day MA
         - Acceleration brake: reduce size when price is running up fast
         """
-        # Spendable capital: EUR minus reserve
-        reserve = portfolio.starting_eur * 0.20  # Reserve floor
+        # Spendable capital: EUR minus reserve.
+        # Reserve is based on EUR balance only — using total portfolio
+        # (including BTC value) creates a death spiral where accumulated
+        # BTC inflates the reserve and prevents further buying.
+        reserve = portfolio.eur_balance * self._cfg_risk.reserve_floor_pct
         spendable = max(0.0, portfolio.eur_balance - reserve)
 
         if spendable <= 0:

@@ -45,7 +45,7 @@ IMPORTANT CONTEXT:
 
 You must respond with ONLY a JSON object, no other text. The JSON must have exactly these fields:
 {
-  "regime": "<one of: accumulation, markup, distribution, markdown, capitulation>",
+  "regime": "<one of: accumulation, markup, distribution, decline, capitulation>",
   "sentiment": <float from -1.0 (extreme fear) to 1.0 (extreme greed)>,
   "risk_level": "<one of: low, medium, high, extreme>",
   "themes": ["<key theme 1>", "<key theme 2>", "<key theme 3>"]
@@ -318,9 +318,14 @@ class OllamaAnalyst:
 
         # Extract and validate regime
         regime = str(data.get("regime", "")).lower().strip()
+
+        # Map legacy/ambiguous values
+        regime_aliases = {"markdown": "decline"}
+        regime = regime_aliases.get(regime, regime)
+
         valid_regimes = {
             "accumulation", "markup", "distribution",
-            "markdown", "capitulation",
+            "decline", "capitulation",
         }
         if regime not in valid_regimes:
             logger.debug(f"Invalid regime '{regime}', defaulting to 'accumulation'")

@@ -345,8 +345,9 @@ class Bot:
 
         # 9. DCA floor: if no buy occurred and it's been too long, force minimum buy
         if self._should_dca_floor(portfolio, cycle, composite):
-            self._handle_dca_floor_buy(portfolio, cycle, composite)
-            return
+            bought = self._handle_dca_floor_buy(portfolio, cycle, composite)
+            if bought:
+                return
 
         # 10. Log current state (no action taken)
         logger.info(
@@ -387,8 +388,10 @@ class Bot:
         if hours_since_buy < cfg.dca_floor_interval_hours:
             return False
 
-        # Check we have spendable EUR
-        reserve = portfolio.starting_eur * self._config.risk.reserve_floor_pct
+        # Reserve is based on EUR balance only, not total portfolio.
+        # Using total portfolio creates a death spiral: more BTC → higher
+        # reserve → less spendable EUR → can't accumulate more BTC.
+        reserve = portfolio.eur_balance * self._config.risk.reserve_floor_pct
         spendable = max(0.0, portfolio.eur_balance - reserve)
         if spendable <= 0:
             return False
@@ -400,19 +403,31 @@ class Bot:
         portfolio: PortfolioState,
         cycle: CycleState,
         signal: CompositeSignal,
-    ) -> None:
-        """Execute a minimum-size DCA floor buy."""
+    ) -> bool:
+        """
+        Execute a minimum-size DCA floor buy.
+
+        Returns True if a buy order was placed, False if skipped.
+        """
         cfg = self._config.sizing
-        reserve = portfolio.starting_eur * self._config.risk.reserve_floor_pct
+        # Reserve based on EUR balance only (not total portfolio)
+        reserve = portfolio.eur_balance * self._config.risk.reserve_floor_pct
         spendable = max(0.0, portfolio.eur_balance - reserve)
 
         eur_amount = spendable * cfg.dca_floor_fraction
         min_eur = self._config.kraken.min_order_btc * portfolio.btc_price
+
+        # If calculated amount is below minimum but we have enough spendable
+        # EUR, bump up to minimum. The floor is a safety net — it must buy.
         if eur_amount < min_eur:
-            logger.debug(
-                f"DCA floor: €{eur_amount:.0f} below minimum €{min_eur:.0f}"
-            )
-            return
+            if spendable >= min_eur:
+                eur_amount = min_eur
+            else:
+                logger.info(
+                    f"DCA floor: €{spendable:.0f} spendable below "
+                    f"minimum order €{min_eur:.0f} — skipping"
+                )
+                return False
 
         hours_since = (time.time() - self._last_buy_time) / 3600
 
@@ -433,6 +448,7 @@ class Bot:
         # Use LOW urgency — no rush, just maintaining accumulation
         risk = RiskDecision(allowed=True, reason="DCA floor override")
         self._handle_buy(portfolio, cycle, signal, buy_size, risk)
+        return True
 
     # ─── Slow loop — background data refresh ─────────────────────────────
 

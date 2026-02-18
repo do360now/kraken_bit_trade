@@ -43,12 +43,12 @@ def main() -> None:
         description="Bitcoin accumulation bot backtester",
     )
     parser.add_argument(
-        "--start", default="2020-01-01",
-        help="Start date (YYYY-MM-DD). Default: 2020-01-01",
+        "--start", default="2024-04-20",
+        help="Start date (YYYY-MM-DD). Default: 2024-04-20",
     )
     parser.add_argument(
-        "--end", default="2024-12-31",
-        help="End date (YYYY-MM-DD). Default: 2024-12-31",
+        "--end", default="2027-02-18",
+        help="End date (YYYY-MM-DD). Default: 2027-02-18",
     )
     parser.add_argument(
         "--capital", type=float, default=10_000.0,
