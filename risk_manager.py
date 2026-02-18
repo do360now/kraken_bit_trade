@@ -1,317 +1,393 @@
 """
-RiskManager - Risk Assessment and Position Sizing
+Risk manager — cycle-aware risk gating for the trading bot.
 
-This module consolidates all risk-related logic into one place.
-Provides a simple interface while hiding complex risk calculations.
+Decides whether a trade is allowed, enforces emergency sell logic with
+golden rule floor protection, manages drawdown tracking, and provides
+cycle-adjusted stop levels.
 
-PUBLIC INTERFACE:
-    can_buy() -> bool
-    can_sell() -> bool
-    position_size() -> float
-    should_emergency_sell() -> bool
+Key lessons from previous bot:
+- Golden rule floor protection: don't emergency sell above estimated cycle floor.
+- Bear capitulation override: allow DCA buys even at elevated risk levels.
+- Reserve floor: never go below 20% of starting EUR balance.
+- Daily trade count limits with proper reset logic.
 
-PRIVATE IMPLEMENTATION:
-    Risk score calculations
-    Portfolio volatility analysis
-    Position concentration checks
-    Drawdown monitoring
+Design:
+- can_trade() is the main gate: returns (allowed, reason) for every decision.
+- emergency_sell() checks if portfolio is in danger requiring immediate exit.
+- get_stops() provides cycle-adjusted stop-loss levels.
+- All state is persisted for restart recovery.
+- Never raises exceptions past the public interface.
 """
+from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
-from enum import Enum
-from logger_config import logger
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from config import BotConfig, CyclePhase, RiskConfig, PersistenceConfig
+from cycle_detector import CycleState
+from signal_engine import Action, CompositeSignal
+
+logger = logging.getLogger(__name__)
 
 
-class RiskLevel(Enum):
-    """Risk level classification."""
-    LOW = "low"
-    MODERATE = "moderate"
-    HIGH = "high"
-    CRITICAL = "critical"
+# ─── Output dataclasses ──────────────────────────────────────────────────────
 
-
-@dataclass
-class RiskMetrics:
-    """Risk assessment results."""
-    risk_level: RiskLevel
-    risk_score: float  # 0.0 to 1.0
-    can_trade: bool
-    position_size_adjustment: float  # Multiplier for position size
+@dataclass(frozen=True)
+class RiskDecision:
+    """Result of a risk check."""
+    allowed: bool
     reason: str
+    override_active: bool = False  # True if capitulation override engaged
 
 
-@dataclass
+@dataclass(frozen=True)
+class StopLevels:
+    """Cycle-adjusted stop-loss levels for an open position."""
+    stop_price: float         # Hard stop — exit if price drops below this
+    warning_price: float      # Soft warning — reduce position if hit
+    atr_width: float          # ATR-based distance from entry to stop
+
+    @property
+    def valid(self) -> bool:
+        """Stop levels are valid if prices are positive and ordered."""
+        return 0 < self.stop_price < self.warning_price
+
+
+@dataclass(frozen=True)
 class PortfolioState:
-    """Current portfolio state for risk calculations."""
-    btc_balance: float
+    """Current portfolio snapshot for risk assessment."""
     eur_balance: float
-    current_price: float
-    avg_buy_price: float
-    unrealized_pnl: float
-    win_rate: float
-    volatility: float
-    max_daily_drawdown: float
+    btc_balance: float
+    btc_price: float
+    starting_eur: float       # Initial EUR balance for reserve floor calc
 
+    @property
+    def total_value_eur(self) -> float:
+        """Total portfolio value in EUR."""
+        return self.eur_balance + self.btc_balance * self.btc_price
+
+    @property
+    def btc_value_eur(self) -> float:
+        return self.btc_balance * self.btc_price
+
+    @property
+    def eur_allocation(self) -> float:
+        """Fraction of portfolio in EUR (0.0–1.0)."""
+        total = self.total_value_eur
+        if total <= 0:
+            return 1.0
+        return self.eur_balance / total
+
+    @property
+    def btc_allocation(self) -> float:
+        """Fraction of portfolio in BTC (0.0–1.0)."""
+        return 1.0 - self.eur_allocation
+
+
+# ─── Risk Manager ────────────────────────────────────────────────────────────
 
 class RiskManager:
     """
-    Manages all risk-related decisions and calculations.
+    Cycle-aware risk management gate.
 
-    Philosophy:
-    - Conservative by default
-    - Multiple risk checks before allowing trades
-    - Automatic position sizing reduction under stress
-    - Clear emergency exit conditions
+    Every trade attempt passes through can_trade() before execution.
+    The risk manager tracks drawdowns, enforces reserve floors, limits
+    daily trade counts, and provides emergency sell logic.
+
+    Args:
+        config: Bot configuration (risk parameters).
     """
 
-    def __init__(
+    def __init__(self, config: BotConfig) -> None:
+        self._cfg = config.risk
+        self._persistence = config.persistence
+
+        # Mutable state
+        self._daily_trade_count: int = 0
+        self._trade_count_date: str = ""  # ISO date for reset tracking
+        self._peak_portfolio_eur: float = 0.0
+        self._starting_eur: Optional[float] = None
+
+        self._load_state()
+
+    # ─── Public interface ────────────────────────────────────────────────
+
+    def can_trade(
         self,
-        max_position_pct: float = 0.15,
-        stop_loss_pct: float = 0.03,
-        take_profit_pct: float = 0.10,
-        max_daily_trades: int = 8,
-        max_drawdown_pct: float = 0.15,
-        risk_per_trade: float = 0.01,
-    ):
+        signal: CompositeSignal,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+    ) -> RiskDecision:
         """
-        Initialize risk manager.
+        Main risk gate — determines if a trade should proceed.
+
+        Checks in order:
+        1. Daily trade limit
+        2. Reserve floor (for buys)
+        3. Drawdown tolerance (cycle-adjusted)
+        4. Capitulation override (for buys in bear markets)
+
+        Returns RiskDecision with allowed flag and reason.
+        """
+        # Initialize starting EUR on first call
+        if self._starting_eur is None:
+            self._starting_eur = portfolio.eur_balance + portfolio.btc_value_eur
+            self._peak_portfolio_eur = self._starting_eur
+            self._save_state()
+
+        # Update peak portfolio value
+        current_total = portfolio.total_value_eur
+        if current_total > self._peak_portfolio_eur:
+            self._peak_portfolio_eur = current_total
+
+        # ── Check 1: Daily trade limit ───────────────────────────────
+        self._maybe_reset_daily_count()
+        if self._daily_trade_count >= self._cfg.max_daily_trades:
+            return RiskDecision(
+                allowed=False,
+                reason=f"Daily trade limit reached ({self._cfg.max_daily_trades})",
+            )
+
+        # ── Direction-specific checks ────────────────────────────────
+        if signal.is_buy:
+            return self._check_buy_risk(portfolio, cycle)
+        elif signal.is_sell:
+            return self._check_sell_risk(portfolio, cycle)
+        else:
+            return RiskDecision(allowed=False, reason="Signal is HOLD — no trade")
+
+    def emergency_sell(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+    ) -> RiskDecision:
+        """
+        Check if an emergency sell is needed.
+
+        Golden rule: don't emergency sell if price is above the estimated
+        cycle floor. Emergency sells only trigger when the portfolio is in
+        genuine danger AND price is below a level that suggests structural
+        breakdown rather than normal volatility.
+        """
+        if not self._cfg.enable_golden_rule_floor:
+            # Emergency sells fully disabled — backtest-proven that selling
+            # during crashes destroys accumulation
+            return RiskDecision(
+                allowed=False,
+                reason="Emergency sells disabled (enable_golden_rule_floor=False)",
+            )
+
+        # Golden rule floor protection
+        floor = cycle.price_structure.position_in_range
+        drawdown = self._portfolio_drawdown(portfolio)
+
+        # Only emergency sell if:
+        # 1. Drawdown exceeds 1.5x the phase tolerance
+        # 2. Price is in the bottom 15% of the estimated range (near floor)
+        extreme_drawdown = drawdown > cycle.drawdown_tolerance * 1.5
+        near_floor = floor < 0.15
+
+        if extreme_drawdown and near_floor:
+            return RiskDecision(
+                allowed=True,
+                reason=f"Emergency: drawdown {drawdown:.1%} with price near "
+                       f"cycle floor (range position={floor:.2f})",
+            )
+
+        if extreme_drawdown and not near_floor:
+            logger.warning(
+                f"Drawdown extreme ({drawdown:.1%}) but price not near floor "
+                f"(range={floor:.2f}). Golden rule holding — no emergency sell."
+            )
+            return RiskDecision(
+                allowed=False,
+                reason=f"Golden rule: drawdown {drawdown:.1%} but price "
+                       f"above floor (range={floor:.2f}). Holding.",
+            )
+
+        return RiskDecision(allowed=False, reason="No emergency condition")
+
+    def get_stops(
+        self,
+        entry_price: float,
+        current_price: float,
+        cycle: CycleState,
+        atr_value: Optional[float] = None,
+    ) -> StopLevels:
+        """
+        Compute cycle-adjusted stop-loss levels.
+
+        Stop width scales with:
+        - ATR (volatility-based distance)
+        - Cycle phase (wider in accumulation, tighter in distribution)
+        - A configurable multiplier
 
         Args:
-            max_position_pct: Maximum position size as % of capital
-            stop_loss_pct: Stop loss percentage
-            take_profit_pct: Take profit percentage
-            max_daily_trades: Maximum trades per day
-            max_drawdown_pct: Maximum portfolio drawdown allowed
-            risk_per_trade: Risk as % of capital per trade
+            entry_price: Price at which position was entered.
+            current_price: Current market price.
+            cycle: Current cycle state.
+            atr_value: Current ATR value. If None, uses 2% of price as fallback.
         """
-        self.max_position_pct = max_position_pct
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
-        self.max_daily_trades = max_daily_trades
-        self.max_drawdown_pct = max_drawdown_pct
-        self.risk_per_trade = risk_per_trade
+        if atr_value is None or atr_value <= 0:
+            atr_value = current_price * 0.02  # 2% fallback
 
-        # Risk thresholds
-        self.high_volatility_threshold = 0.08  # 8%
-        self.critical_volatility_threshold = 0.12  # 12%
-        self.max_position_concentration = 0.25  # Max 25% of capital in one asset
+        # Phase-adjusted ATR multiplier
+        phase_multipliers = {
+            CyclePhase.CAPITULATION: 3.5,     # Wide — expect volatility
+            CyclePhase.ACCUMULATION: 3.0,
+            CyclePhase.EARLY_BULL: 2.5,
+            CyclePhase.GROWTH: 2.0,
+            CyclePhase.EUPHORIA: 1.5,         # Tight — protect profits
+            CyclePhase.DISTRIBUTION: 1.5,
+            CyclePhase.EARLY_BEAR: 2.0,
+        }
+        phase_mult = phase_multipliers.get(cycle.phase, self._cfg.stop_atr_multiplier)
 
-        # Tracking
-        self.daily_trade_count = 0
-        self.today_pnl = 0.0
-        self.peak_portfolio_value = 1.0
+        atr_width = atr_value * phase_mult
+        stop_price = max(0.0, entry_price - atr_width)
+        warning_price = max(stop_price, entry_price - atr_width * 0.6)
 
-    def assess_risk(self, portfolio: PortfolioState) -> RiskMetrics:
-        """
-        Comprehensive risk assessment.
-
-        Returns RiskMetrics with overall risk level and position sizing adjustment.
-        """
-        risk_score = 0.0
-        reasons = []
-
-        # Check volatility
-        if portfolio.volatility > self.critical_volatility_threshold:
-            risk_score += 0.4
-            reasons.append("CRITICAL volatility")
-        elif portfolio.volatility > self.high_volatility_threshold:
-            risk_score += 0.2
-            reasons.append("HIGH volatility")
-
-        # Check drawdown
-        max_drawdown = self._calculate_drawdown(portfolio)
-        if max_drawdown > self.max_drawdown_pct:
-            risk_score += 0.3
-            reasons.append("Excessive drawdown")
-
-        # Check position concentration
-        position_concentration = (
-            (portfolio.btc_balance * portfolio.current_price)
-            / (portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance)
-            if (portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance)
-            > 0
-            else 0
-        )
-        if position_concentration > self.max_position_concentration:
-            risk_score += 0.2
-            reasons.append("High position concentration")
-
-        # Check win rate
-        if portfolio.win_rate < 0.4:
-            risk_score += 0.15
-            reasons.append("Low win rate")
-
-        # Determine risk level
-        if risk_score >= 0.7:
-            risk_level = RiskLevel.CRITICAL
-            position_adjustment = 0.25  # 25% of normal size
-            can_trade = False
-        elif risk_score >= 0.5:
-            risk_level = RiskLevel.HIGH
-            position_adjustment = 0.5  # 50% of normal size
-            can_trade = True
-        elif risk_score >= 0.3:
-            risk_level = RiskLevel.MODERATE
-            position_adjustment = 0.75  # 75% of normal size
-            can_trade = True
-        else:
-            risk_level = RiskLevel.LOW
-            position_adjustment = 1.0  # Full position size
-            can_trade = True
-
-        reason = (
-            "; ".join(reasons) if reasons else "All risk metrics within acceptable range"
+        return StopLevels(
+            stop_price=stop_price,
+            warning_price=warning_price,
+            atr_width=atr_width,
         )
 
-        logger.info(
-            f"Risk Assessment: Level={risk_level.value}, Score={risk_score:.2f}, "
-            f"PositionAdjustment={position_adjustment:.0%}"
-        )
+    def record_trade(self) -> None:
+        """Record that a trade was executed. Updates daily count."""
+        self._maybe_reset_daily_count()
+        self._daily_trade_count += 1
+        self._save_state()
+        logger.info(f"Trade recorded. Daily count: {self._daily_trade_count}")
 
-        return RiskMetrics(
-            risk_level=risk_level,
-            risk_score=risk_score,
-            can_trade=can_trade,
-            position_size_adjustment=position_adjustment,
-            reason=reason,
-        )
+    def get_drawdown(self, portfolio: PortfolioState) -> float:
+        """Current portfolio drawdown from peak (0.0–1.0)."""
+        return self._portfolio_drawdown(portfolio)
 
-    def can_buy(self, portfolio: PortfolioState) -> bool:
-        """
-        Check if buying is allowed given current risk conditions.
+    # ─── Private checks ──────────────────────────────────────────────────
 
-        Multiple checks:
-        1. Risk level allows trading
-        2. Haven't exceeded daily trade limit
-        3. Have sufficient capital
-        4. Position not too concentrated
-        """
-        risk_metrics = self.assess_risk(portfolio)
-
-        if not risk_metrics.can_trade:
-            logger.warning(f"⛔ Cannot buy - High risk: {risk_metrics.reason}")
-            return False
-
-        if self.daily_trade_count >= self.max_daily_trades:
-            logger.warning(f"⛔ Cannot buy - Daily trade limit reached ({self.daily_trade_count})")
-            return False
-
-        if portfolio.eur_balance < 5.0:
-            logger.warning(f"⛔ Cannot buy - Insufficient EUR balance (€{portfolio.eur_balance:.2f})")
-            return False
-
-        logger.info("✅ Buy check passed")
-        return True
-
-    def can_sell(self, portfolio: PortfolioState) -> bool:
-        """
-        Check if selling is allowed.
-
-        Generally more permissive than buying - we should be able to exit positions
-        even in high-risk situations.
-        """
-        if portfolio.btc_balance < 0.00001:
-            logger.warning("⛔ Cannot sell - No BTC position")
-            return False
-
-        logger.info("✅ Sell check passed")
-        return True
-
-    def should_emergency_sell(self, portfolio: PortfolioState) -> bool:
-        """
-        Determine if we should force-sell to protect capital.
-
-        Triggers:
-        1. Drawdown exceeds threshold
-        2. Volatility critical and losing money
-        3. Portfolio underwater
-        """
-        risk_metrics = self.assess_risk(portfolio)
-
-        if risk_metrics.risk_level == RiskLevel.CRITICAL:
-            if portfolio.unrealized_pnl < -0.05 * (
-                portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-            ):
-                logger.error("🚨 EMERGENCY SELL - Critical risk + losses")
-                return True
-
-        return False
-
-    def calculate_position_size(
+    def _check_buy_risk(
         self,
-        available_eur: float,
-        current_price: float,
         portfolio: PortfolioState,
-        base_position_pct: float = 0.10,
-    ) -> float:
-        """
-        Calculate safe position size given risk conditions.
+        cycle: CycleState,
+    ) -> RiskDecision:
+        """Risk checks specific to buy orders."""
+        # Reserve floor: never go below reserve_floor_pct of starting EUR
+        starting = self._starting_eur or portfolio.total_value_eur
+        reserve_floor = starting * self._cfg.reserve_floor_pct
 
-        Applies risk adjustments based on current portfolio state.
-        """
-        if available_eur <= 0 or current_price <= 0:
+        if portfolio.eur_balance <= reserve_floor:
+            return RiskDecision(
+                allowed=False,
+                reason=f"EUR balance €{portfolio.eur_balance:,.0f} at or below "
+                       f"reserve floor €{reserve_floor:,.0f} "
+                       f"({self._cfg.reserve_floor_pct:.0%} of starting)",
+            )
+
+        # Drawdown check
+        drawdown = self._portfolio_drawdown(portfolio)
+        tolerance = cycle.drawdown_tolerance
+
+        if drawdown > tolerance:
+            # Capitulation override: allow buys during capitulation
+            # even at elevated drawdowns (DCA into the bottom)
+            if (self._cfg.enable_capitulation_override
+                    and cycle.phase in (CyclePhase.CAPITULATION, CyclePhase.ACCUMULATION)):
+                logger.info(
+                    f"Capitulation override: allowing buy despite "
+                    f"drawdown {drawdown:.1%} > tolerance {tolerance:.1%} "
+                    f"in {cycle.phase.value} phase"
+                )
+                return RiskDecision(
+                    allowed=True,
+                    reason=f"Capitulation override in {cycle.phase.value}: "
+                           f"DCA buying despite drawdown {drawdown:.1%}",
+                    override_active=True,
+                )
+
+            return RiskDecision(
+                allowed=False,
+                reason=f"Drawdown {drawdown:.1%} exceeds phase tolerance "
+                       f"{tolerance:.1%} ({cycle.phase.value})",
+            )
+
+        return RiskDecision(
+            allowed=True,
+            reason=f"Buy allowed: drawdown {drawdown:.1%} within "
+                   f"tolerance {tolerance:.1%} ({cycle.phase.value})",
+        )
+
+    def _check_sell_risk(
+        self,
+        portfolio: PortfolioState,
+        cycle: CycleState,
+    ) -> RiskDecision:
+        """Risk checks specific to sell orders."""
+        # Can't sell if no BTC
+        if portfolio.btc_balance <= 0:
+            return RiskDecision(
+                allowed=False,
+                reason="No BTC to sell",
+            )
+
+        return RiskDecision(
+            allowed=True,
+            reason=f"Sell allowed in {cycle.phase.value} phase",
+        )
+
+    def _portfolio_drawdown(self, portfolio: PortfolioState) -> float:
+        """Calculate current drawdown from peak portfolio value."""
+        if self._peak_portfolio_eur <= 0:
             return 0.0
+        current = portfolio.total_value_eur
+        return max(0.0, 1.0 - current / self._peak_portfolio_eur)
 
-        # Get risk adjustment
-        risk_metrics = self.assess_risk(portfolio)
+    def _maybe_reset_daily_count(self) -> None:
+        """Reset daily trade count if the date has changed."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._trade_count_date:
+            if self._daily_trade_count > 0:
+                logger.info(
+                    f"Daily trade count reset (was {self._daily_trade_count})"
+                )
+            self._daily_trade_count = 0
+            self._trade_count_date = today
 
-        # Calculate base position
-        position_eur = available_eur * base_position_pct
+    # ─── State persistence ───────────────────────────────────────────────
 
-        # Apply risk adjustment
-        adjusted_position_eur = position_eur * risk_metrics.position_size_adjustment
+    def _state_path(self) -> Path:
+        return self._persistence.get_path("risk_state.json")
 
-        # Cap at max position
-        max_position_eur = available_eur * self.max_position_pct
-        adjusted_position_eur = min(adjusted_position_eur, max_position_eur)
+    def _load_state(self) -> None:
+        """Load persisted risk state."""
+        path = self._state_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+            self._daily_trade_count = int(data.get("daily_trade_count", 0))
+            self._trade_count_date = data.get("trade_count_date", "")
+            self._peak_portfolio_eur = float(data.get("peak_portfolio_eur", 0.0))
+            starting = data.get("starting_eur")
+            self._starting_eur = float(starting) if starting is not None else None
+            logger.info(f"Loaded risk state: peak=€{self._peak_portfolio_eur:,.0f}")
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            logger.warning(f"Failed to load risk state: {exc}")
 
-        # Ensure minimum (only if buying is allowed)
-        min_position_eur = 5.0  # Minimum €5
-        if risk_metrics.can_trade:
-            adjusted_position_eur = max(adjusted_position_eur, min_position_eur)
-
-        # Convert to BTC
-        btc_amount = adjusted_position_eur / current_price
-
-        logger.info(
-            f"Position sizing: {btc_amount:.8f} BTC "
-            f"(€{adjusted_position_eur:.2f}, adjusted {risk_metrics.position_size_adjustment:.0%})"
-        )
-
-        return btc_amount
-
-    # =========================================================================
-    # PRIVATE METHODS
-    # =========================================================================
-
-    def _calculate_drawdown(self, portfolio: PortfolioState) -> float:
-        """Calculate current portfolio drawdown from peak."""
-        if self.peak_portfolio_value <= 0:
-            return 0.0
-
-        current_value = (
-            portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-        )
-        drawdown = (self.peak_portfolio_value - current_value) / self.peak_portfolio_value
-
-        return max(0.0, drawdown)
-
-    def record_trade(self, is_buy: bool):
-        """Record a trade for daily limit tracking."""
-        self.daily_trade_count += 1
-        logger.debug(f"Trade recorded: {self.daily_trade_count}/{self.max_daily_trades} daily limit")
-
-    def reset_daily_limits(self):
-        """Reset daily trading limits (call at end of day)."""
-        self.daily_trade_count = 0
-        self.today_pnl = 0.0
-        logger.info("Daily limits reset")
-
-    def update_peak_value(self, portfolio: PortfolioState):
-        """Update peak portfolio value for drawdown calculation."""
-        current_value = (
-            portfolio.btc_balance * portfolio.current_price + portfolio.eur_balance
-        )
-        if current_value > self.peak_portfolio_value:
-            self.peak_portfolio_value = current_value
+    def _save_state(self) -> None:
+        """Persist risk state to disk."""
+        try:
+            data = {
+                "daily_trade_count": self._daily_trade_count,
+                "trade_count_date": self._trade_count_date,
+                "peak_portfolio_eur": self._peak_portfolio_eur,
+                "starting_eur": self._starting_eur,
+            }
+            self._state_path().write_text(json.dumps(data, indent=2))
+        except OSError as exc:
+            logger.error(f"Failed to save risk state: {exc}")
