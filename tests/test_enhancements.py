@@ -226,7 +226,7 @@ class TestAsymmetricAgreement:
         engine = SignalEngine(config)
 
         action = engine._determine_action(
-            score=15.0, agreement=0.40, data_quality=0.8,
+            score=20.0, agreement=0.40, data_quality=0.8,
         )
         assert action == Action.BUY
 
@@ -251,17 +251,17 @@ class TestAsymmetricAgreement:
         assert action == Action.HOLD
 
     def test_score_asymmetry_exists(self, tmp_path):
-        """Buy threshold (10) is easier to hit than sell threshold (-20)."""
+        """Buy threshold (18) is harder to hit than sell threshold (-21)."""
         config = make_config(tmp_path)
         engine = SignalEngine(config)
 
-        # Score +12: triggers buy
+        # Score +20: triggers buy (above 18)
         buy_action = engine._determine_action(
-            score=12.0, agreement=0.50, data_quality=0.8,
+            score=20.0, agreement=0.50, data_quality=0.8,
         )
-        # Score -12: does NOT trigger sell (need -20)
+        # Score -15: does NOT trigger sell (need -21 or lower)
         sell_action = engine._determine_action(
-            score=-12.0, agreement=0.50, data_quality=0.8,
+            score=-15.0, agreement=0.50, data_quality=0.8,
         )
 
         assert buy_action == Action.BUY
@@ -657,7 +657,7 @@ class TestDCAFloor:
     def test_handle_buy_updates_last_buy_time(self, tmp_path):
         """_handle_buy sets _last_buy_time on execution."""
         bot = self._make_bot(tmp_path, paper=True)
-        assert bot._risk_manager._last_buy_time == 0.0
+        assert bot._risk_manager._last_buy_time == int(time.time())  # Initialized to current time
 
         portfolio = make_portfolio()
         cycle = make_cycle()

@@ -383,7 +383,7 @@ class Bot:
             return False
 
         # Check time since last buy
-        hours_since_buy = (time.time() - self._risk_manager.last_buy_time) / 3600
+        hours_since_buy = int((time.time()) - self._risk_manager.last_buy_time) / 3600
         if hours_since_buy < cfg.dca_floor_interval_hours:
             return False
 

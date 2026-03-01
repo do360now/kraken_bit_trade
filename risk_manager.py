@@ -112,7 +112,7 @@ class RiskManager:
         self._trade_count_date: str = ""  # ISO date for reset tracking
         self._peak_portfolio_eur: float = 0.0
         self._starting_eur: Optional[float] = None
-        self._last_buy_time: float = time.time()  # Timestamp of last buy for DCA floor
+        self._last_buy_time: float = int(time.time())  # Timestamp of last buy for DCA floor
 
         self._load_state()
 

@@ -594,7 +594,7 @@ class TestActionDetermination:
     def test_buy(self, tmp_path):
         engine = make_engine(tmp_path)
         # Score 15: above buy_threshold (10) but below strong_buy (20)
-        action = engine._determine_action(score=15.0, agreement=0.7, data_quality=0.8)
+        action = engine._determine_action(score=18.0, agreement=0.7, data_quality=0.8)
         assert action == Action.BUY
 
     def test_hold_neutral_score(self, tmp_path):

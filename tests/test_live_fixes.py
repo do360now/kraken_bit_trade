@@ -268,7 +268,7 @@ class TestSignalPhaseInteraction:
         config = make_config(tmp_path)
         engine = SignalEngine(config)
         action = engine._determine_action(
-            score=10.0, agreement=0.50, data_quality=0.82,
+            score=18.0, agreement=0.50, data_quality=0.82,
         )
         assert action == Action.BUY
 
