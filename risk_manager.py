@@ -112,7 +112,7 @@ class RiskManager:
         self._trade_count_date: str = ""  # ISO date for reset tracking
         self._peak_portfolio_eur: float = 0.0
         self._starting_eur: Optional[float] = None
-        self._last_buy_time: float = 0.0  # Timestamp of last buy for DCA floor
+        self._last_buy_time: float = time.time()  # Timestamp of last buy for DCA floor
 
         self._load_state()
 
@@ -388,6 +388,10 @@ class RiskManager:
             starting = data.get("starting_eur")
             self._starting_eur = float(starting) if starting is not None else None
             self._last_buy_time = float(data.get("last_buy_time", 0.0))
+            # On first run (no prior trades), set last_buy_time to now
+            # to avoid immediate DCA floor triggering
+            if self._last_buy_time == 0.0:
+                self._last_buy_time = time.time()
             logger.info(f"Loaded risk state: peak=€{self._peak_portfolio_eur:,.0f}")
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             logger.warning(f"Failed to load risk state: {exc}")

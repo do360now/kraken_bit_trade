@@ -65,3 +65,19 @@ All settings in `config.py`. Uses `.env` for API credentials:
 ### Backtesting
 
 `backtest/backtester.py` replays historical candles through the REAL pipeline modules. Only trade execution is simulated. Data in `backtest/data/`.
+
+## Design Decisions
+
+### No Stop-Loss
+This is a DCA accumulator bot, not a swing trader. Stop-losses are intentionally NOT executed:
+- `RiskManager.get_stops()` computes stop levels but is never called from `main.py`
+- The philosophy: buy through volatility, don't get stopped out
+- Emergency sells (`emergency_sell()`) are still available for catastrophic conditions
+
+### DCA Floor First-Run
+On first run (no prior trade history), `last_buy_time` is initialized to current time:
+- Prevents immediate DCA floor triggering from a stale 0.0 timestamp
+- Set in `RiskManager.__init__()` and validated in `_load_state()`
+
+### Partial Fill Handling
+When orders partially fill, the bot retries for the original full volume (not remaining). This is intentional - if you wanted 100 and got 40, you chase for 100.
