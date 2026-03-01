@@ -162,9 +162,9 @@ class SignalConfig:
     # Minimum agreement among sub-signals before acting
     min_agreement: float = 0.30
     # Buy threshold: score must exceed this to trigger a buy
-    buy_threshold: float = 15.3
+    buy_threshold: float = 18.0
     # Sell threshold: score must drop below this to trigger a sell
-    sell_threshold: float = -20.0
+    sell_threshold: float = -21.0
 
     # Sub-signal weights (should sum to ~1.0)
     rsi_weight: float = 0.20
