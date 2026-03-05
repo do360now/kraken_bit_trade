@@ -321,6 +321,13 @@ class SizingConfig:
     dca_floor_enabled: bool = True
     dca_floor_interval_hours: float = 24.0   # Max hours without a buy
     dca_floor_fraction: float = 0.015        # 1.5% of spendable for floor buys
+    dca_floor_bonus_threshold: float = 15.0  # Signal score threshold for bonus buy
+    dca_floor_bonus_multiplier: float = 2.0  # Multiply DCA amount when signal is strong
+
+    # ── Positive divergence detection ─────────────────────────────────
+    # Detects when price makes lower low but signal stays higher (bullish divergence)
+    divergence_lookback_hours: float = 24.0  # Lookback period for low detection
+    divergence_boost: float = 10.0  # Add to signal score when divergence detected
 
 
 # ─── Timing config ───────────────────────────────────────────────────────────

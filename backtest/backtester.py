@@ -465,6 +465,11 @@ class BacktestEngine:
                     if floor_eur < min_eur and spendable >= min_eur:
                         floor_eur = min_eur
 
+                    # Check for bonus DCA buy if signal is strong
+                    is_bonus = composite.score >= dca_floor_cfg.dca_floor_bonus_threshold
+                    if is_bonus:
+                        floor_eur *= dca_floor_cfg.dca_floor_bonus_multiplier
+
                     if floor_eur >= min_eur and floor_eur <= eur:
                         buy_btc, fee = self._simulate_buy(floor_eur, price)
                         eur -= floor_eur
@@ -479,7 +484,7 @@ class BacktestEngine:
                             date=candle.date, side="buy",
                             eur_amount=floor_eur, btc_amount=buy_btc,
                             price=price, fee_eur=fee,
-                            reason=f"DCA floor ({hours_since:.0f}h gap)",
+                            reason=f"DCA floor ({hours_since:.0f}h gap){' + BONUS' if is_bonus else ''}",
                             phase=cycle.phase.value,
                             signal_score=composite.score,
                             portfolio_value_eur=eur + btc * price,

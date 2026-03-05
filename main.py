@@ -23,6 +23,7 @@ Paper trade mode:
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import signal
 import sys
@@ -89,6 +90,12 @@ class Bot:
 
         # ── Accumulated OHLCV from fast loop ─────────────────────────
         self._fast_candles: list[OHLCCandle] = []
+
+        # ── Positive divergence tracking ─────────────────────────────────
+        # Track 24h lows for price and signal to detect bullish divergence
+        self._divergence_price_low: float = float('inf')
+        self._divergence_signal_low: float = float('inf')
+        self._divergence_last_update: float = 0.0
 
         # ── DCA floor tracking via risk_manager ───────────────────────
 
@@ -280,6 +287,23 @@ class Bot:
             llm=self._llm_cache,
         )
 
+        # 4b. Update divergence tracking
+        self._update_divergence_tracking(ticker.last, composite.score)
+
+        # 4c. Check for positive divergence and boost signal if detected
+        divergence_boost = self._check_divergence(ticker.last, composite.score)
+        if divergence_boost > 0:
+            # Apply boost by creating a modified signal
+            original_score = composite.score
+            composite = dataclasses.replace(
+                composite,
+                score=composite.score + divergence_boost,
+            )
+            logger.info(
+                f"Signal boosted: {original_score:.1f} -> {composite.score:.1f} "
+                f"(+{divergence_boost} divergence)"
+            )
+
         # 5. Build portfolio state
         balance = self._api.get_balance()
         if balance is None:
@@ -404,7 +428,7 @@ class Bot:
         signal: CompositeSignal,
     ) -> bool:
         """
-        Execute a minimum-size DCA floor buy.
+        Execute a minimum-size DCA floor buy, with bonus if signal is strong.
 
         Returns True if a buy order was placed, False if skipped.
         """
@@ -430,10 +454,18 @@ class Bot:
 
         hours_since = (time.time() - self._risk_manager.last_buy_time) / 3600
 
+        # Check for bonus buy if signal is strong
+        is_bonus = signal.score >= cfg.dca_floor_bonus_threshold
+        if is_bonus:
+            eur_amount *= cfg.dca_floor_bonus_multiplier
+            bonus_reason = f" (BONUS: signal={signal.score:.1f} >= {cfg.dca_floor_bonus_threshold})"
+        else:
+            bonus_reason = ""
+
         logger.info(
             f"DCA FLOOR: €{eur_amount:,.0f} "
             f"({hours_since:.0f}h since last buy, "
-            f"phase={cycle.phase.value})"
+            f"phase={cycle.phase.value}){bonus_reason}"
         )
 
         buy_size = BuySize(
@@ -441,14 +473,65 @@ class Bot:
             # Ensure at least min_order_btc to avoid "below minimum" errors
             btc_amount=max(eur_amount / portfolio.btc_price, self._config.kraken.min_order_btc),
             fraction_of_capital=eur_amount / spendable if spendable > 0 else 0.0,
-            adjustments={"dca_floor": 1.0},
-            reason=f"DCA floor: {hours_since:.0f}h without buy",
+            adjustments={"dca_floor": 1.0, "bonus": is_bonus},
+            reason=f"DCA floor: {hours_since:.0f}h without buy" + (" + BONUS" if is_bonus else ""),
         )
 
         # Use LOW urgency — no rush, just maintaining accumulation
         risk = RiskDecision(allowed=True, reason="DCA floor override")
         self._handle_buy(portfolio, cycle, signal, buy_size, risk)
         return True
+
+    # ─── Positive divergence detection ───────────────────────────────────
+
+    def _update_divergence_tracking(self, price: float, signal_score: float) -> None:
+        """
+        Track price and signal lows to detect bullish divergence.
+
+        Positive divergence = price makes new low but signal stays above prior low.
+        This often signals a bottom is near.
+        """
+        cfg = self._config.sizing
+        lookback_seconds = cfg.divergence_lookback_hours * 3600
+        now = time.time()
+
+        # Reset tracking if we've passed the lookback period
+        if now - self._divergence_last_update > lookback_seconds:
+            self._divergence_price_low = price
+            self._divergence_signal_low = signal_score
+            self._divergence_last_update = now
+        else:
+            # Update lows if current values are lower
+            if price < self._divergence_price_low:
+                self._divergence_price_low = price
+            if signal_score < self._divergence_signal_low:
+                self._divergence_signal_low = signal_score
+
+    def _check_divergence(self, price: float, signal_score: float) -> float:
+        """
+        Check for positive divergence and return boost if detected.
+
+        Returns the boost amount to add to signal score.
+        """
+        cfg = self._config.sizing
+
+        # Check if price made a new low (within lookback period)
+        # while signal is higher than the prior low signal
+        price_new_low = price <= self._divergence_price_low
+        signal_higher = signal_score > self._divergence_signal_low
+
+        if price_new_low and signal_higher:
+            logger.info(
+                f"POSITIVE DIVERGENCE: price=€{price:.0f} (low={self._divergence_price_low:.0f}) "
+                f"but signal={signal_score:.1f} > prior_low={self._divergence_signal_low:.1f} "
+                f"+{cfg.divergence_boost}"
+            )
+            # Reset tracking after divergence signal
+            self._divergence_price_low = price
+            self._divergence_signal_low = signal_score
+            return cfg.divergence_boost
+
+        return 0.0
 
     # ─── Slow loop — background data refresh ─────────────────────────────
 
