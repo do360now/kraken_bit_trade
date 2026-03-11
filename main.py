@@ -41,6 +41,7 @@ from position_sizer import PositionSizer, BuySize
 from ollama_analyst import OllamaAnalyst
 from trade_executor import TradeExecutor, TradeResult, TradeOutcome
 from performance_tracker import PerformanceTracker
+from macro_event import MacroEventDetector, MacroEventState, EventPhase
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class Bot:
             model=self._config.timing.ollama_model,
             timeout=self._config.timing.ollama_timeout,
         )
+        self._macro_event_detector = MacroEventDetector(self._config)
 
         # ── Cached slow-loop data ────────────────────────────────────
         self._onchain_cache: Optional[OnChainSnapshot] = None
@@ -96,6 +98,11 @@ class Bot:
         self._divergence_price_low: float = float('inf')
         self._divergence_signal_low: float = float('inf')
         self._divergence_last_update: float = 0.0
+
+        # ── Macro event price tracking ───────────────────────────────
+        # Track price at last CPI/FOMC event to detect follow-through dips
+        self._price_at_last_macro_event: Optional[float] = None
+        self._last_macro_event_phase: EventPhase = EventPhase.NORMAL
 
         # ── DCA floor tracking via risk_manager ───────────────────────
 
@@ -285,6 +292,7 @@ class Bot:
             cycle=cycle,
             onchain=self._onchain_cache,
             llm=self._llm_cache,
+            macro_event=self._get_macro_event_state(ticker.last),
         )
 
         # 4b. Update divergence tracking
@@ -482,6 +490,53 @@ class Bot:
         self._handle_buy(portfolio, cycle, signal, buy_size, risk)
         return True
 
+    # ─── Macro event helpers ──────────────────────────────────────────────
+
+    def _get_macro_event_state(self, current_price: float) -> MacroEventState:
+        """
+        Get current macro event state and update price tracking.
+
+        Tracks the price at event release to detect follow-through dips.
+        When transitioning from PRE_EVENT/EVENT_DAY into FOLLOW_THROUGH,
+        snapshot the price so the follow-through dip comparison is accurate.
+        """
+        llm_themes: Optional[tuple[str, ...]] = None
+        llm_regime: Optional[str] = None
+        if self._llm_cache is not None:
+            llm_themes = self._llm_cache.themes
+            llm_regime = self._llm_cache.regime
+
+        event = self._macro_event_detector.analyze(
+            llm_themes=llm_themes,
+            llm_regime=llm_regime,
+            price_at_last_event=self._price_at_last_macro_event,
+            current_price=current_price,
+        )
+
+        # Snapshot price at event day so follow-through dip detection works
+        prev_phase = self._last_macro_event_phase
+        curr_phase = event.event_phase
+
+        if (prev_phase in (EventPhase.PRE_EVENT, EventPhase.EVENT_DAY)
+                and curr_phase == EventPhase.FOLLOW_THROUGH):
+            # Just transitioned into follow-through — snapshot price
+            self._price_at_last_macro_event = current_price
+            logger.info(
+                f"Macro event: transitioning to follow-through at "
+                f"€{current_price:,.0f} — dip detection armed"
+            )
+
+        if curr_phase in (EventPhase.PRE_EVENT, EventPhase.EVENT_DAY):
+            # Keep refreshing the event-day price reference
+            self._price_at_last_macro_event = current_price
+
+        self._last_macro_event_phase = curr_phase
+
+        if curr_phase != EventPhase.NORMAL or event.is_stagflation_regime:
+            logger.info(f"Macro event state: {event.description}")
+
+        return event
+
     # ─── Positive divergence detection ───────────────────────────────────
 
     def _update_divergence_tracking(self, price: float, signal_score: float) -> None:
@@ -619,6 +674,33 @@ class Bot:
             urgency = Urgency.MEDIUM
         else:
             urgency = Urgency.LOW
+
+        # ── Macro event execution adjustments ─────────────────────────
+        # Pre-event / event-day: force LOW urgency (spread-aware, deep in book).
+        # This pre-positions limit orders to catch an algo-driven "hot CPI" dip
+        # without chasing. The dip gets bought passively at a good price.
+        macro_event = self._get_macro_event_state(portfolio.btc_price)
+        event_size_multiplier = 1.0
+
+        if macro_event.event_phase in (EventPhase.PRE_EVENT, EventPhase.EVENT_DAY):
+            urgency = Urgency.LOW  # Always LOW near events — don't chase
+            event_size_multiplier = macro_event.size_multiplier
+            logger.info(
+                f"Macro event override: urgency=LOW, "
+                f"size×{event_size_multiplier:.2f} — {macro_event.description}"
+            )
+
+        # Apply event size multiplier
+        adjusted_eur = buy_size.eur_amount * event_size_multiplier
+        if event_size_multiplier != 1.0:
+            from dataclasses import replace as dc_replace
+            buy_size = dc_replace(
+                buy_size,
+                eur_amount=adjusted_eur,
+                btc_amount=adjusted_eur / portfolio.btc_price if portfolio.btc_price > 0 else 0,
+                fraction_of_capital=buy_size.fraction_of_capital * event_size_multiplier,
+                reason=buy_size.reason + f" [event×{event_size_multiplier:.2f}]",
+            )
 
         logger.info(
             f"BUY: €{buy_size.eur_amount:,.0f} "

@@ -100,37 +100,55 @@ class KrakenConfig:
 
 @dataclass(frozen=True)
 class CycleConfig:
-    """Bitcoin Cycle 4 parameters (halving April 2024)."""
+    """Bitcoin Cycle 4 parameters (halving April 2024).
+
+    MACRO-ERA RECALIBRATION (2026):
+    Bitcoin has graduated from pure halving-cycle mechanics to a macro asset
+    correlated with global M2 money supply and Fed policy. Key adjustments:
+    - time_weight halved: calendar timing is diluted, not dead.
+    - price_structure_weight raised: price vs 200d MA and ATH is the real signal.
+    - cycle_floor raised: institutional buyers prevent 80-90% crashes of prior cycles.
+      77% drawdown from ~€114k ATH ≈ €26k; floor model set conservatively higher at €42k.
+    - estimated_cycle_days extended: institutional smoothing elongates cycles (~4.6yr).
+    - phase_boundaries adjusted: BTC broke prior ATH *before* the 2024 halving, signalling
+      compressed accumulation and a more sustained growth phase.
+    """
     halving_date: datetime = field(
         default_factory=lambda: datetime(2024, 4, 20, tzinfo=timezone.utc)
     )
-    # Estimated cycle duration in days (historically ~1400-1460)
-    estimated_cycle_days: int = 1440
+    # Estimated cycle duration in days — elongating due to institutional participation
+    # Prior cycles: ~1400-1460 days. Current cycle expected ~1600-1700 days.
+    estimated_cycle_days: int = 1680
 
     # Phase boundaries as fraction of cycle elapsed
-    # Based on historical patterns: accumulation → early bull → growth → euphoria → distribution → bear
+    # Adjusted for macro-era dynamics: shorter accumulation (BTC broke ATH pre-halving),
+    # longer sustained growth phase (institutional DCA smooths the curve).
     phase_boundaries: dict[str, float] = field(default_factory=lambda: {
-        "accumulation_end": 0.15,     # ~216 days post-halving
-        "early_bull_end": 0.30,       # ~432 days
-        "growth_end": 0.55,           # ~792 days
-        "euphoria_end": 0.70,         # ~1008 days
-        "distribution_end": 0.85,     # ~1224 days
+        "accumulation_end": 0.12,     # ~202 days post-halving (compressed — BTC broke ATH early)
+        "early_bull_end": 0.28,       # ~470 days
+        "growth_end": 0.62,           # ~1042 days (elongated — institutional smoothing)
+        "euphoria_end": 0.78,         # ~1310 days (stretched distribution zone)
+        "distribution_end": 0.88,     # ~1478 days
         # After distribution_end → early_bear → capitulation until next halving
     })
 
-    # Weight allocation for multi-signal phase detection
-    time_weight: float = 0.35
-    price_structure_weight: float = 0.30
-    momentum_weight: float = 0.25
-    volatility_weight: float = 0.10
+    # Weight allocation for multi-signal phase detection.
+    # time_weight reduced: halving calendar is no longer the dominant driver.
+    # price_structure_weight raised: price vs 200d MA and ATH is the real anchor.
+    # momentum and volatility weights raised to compensate.
+    time_weight: float = 0.15            # Was 0.35 — halving signal diluted, not dead
+    price_structure_weight: float = 0.40  # Was 0.30 — primary signal in macro-driven market
+    momentum_weight: float = 0.30        # Was 0.25 — liquidity-driven momentum matters more
+    volatility_weight: float = 0.15      # Was 0.10 — regime detection still useful
 
     # Diminishing returns model for cycle ceiling estimation
-    # Each cycle peak is roughly this fraction of the previous cycle's multiplier
-    diminishing_returns_factor: float = 0.40
     # Cycle 3 peak was ~69k USD (~60k EUR at the time)
-    # Cycle 4 conservative ceiling estimate in EUR
-    cycle_ceiling_eur: float = 180_000.0
-    cycle_floor_eur: float = 20_000.0  # Estimated absolute floor
+    # Cycle 4 ceiling raised: macro tailwinds + institutional allocation can push further
+    diminishing_returns_factor: float = 0.40
+    cycle_ceiling_eur: float = 200_000.0  # Was 180k — macro/institutional era ceiling
+    # Floor raised: 77% drawdown from ~€114k ATH ≈ €26k.
+    # Institutional buyers provide support at higher levels than retail cycles.
+    cycle_floor_eur: float = 42_000.0    # Was 20k — shallower drawdowns in institutional era
 
     # Phase stability: prevent rapid phase flapping
     min_phase_dwell_cycles: int = 30     # Minimum cycles before allowing transition (~60 min at 2-min loop)
@@ -167,13 +185,17 @@ class SignalConfig:
     sell_threshold: float = -21.0
 
     # Sub-signal weights (should sum to ~1.0)
+    # MACRO-ERA RECALIBRATION: added macro_weight signal (Fed/M2/liquidity context).
+    # cycle_weight reduced: halving timing is a weaker driver than it was.
+    # onchain_weight reduced slightly to accommodate macro signal.
     rsi_weight: float = 0.20
     macd_weight: float = 0.15
     bollinger_weight: float = 0.15
-    cycle_weight: float = 0.20
-    onchain_weight: float = 0.10
+    cycle_weight: float = 0.12          # Was 0.20 — halving cycle less predictive
+    onchain_weight: float = 0.08        # Was 0.10 — slight reduction for macro room
     llm_weight: float = 0.10
     microstructure_weight: float = 0.10
+    macro_weight: float = 0.10          # NEW: global liquidity / Fed policy signal
 
     # ── Asymmetric agreement thresholds ──────────────────────────
     # For accumulation: be patient buying, eager selling at peaks.
@@ -185,35 +207,36 @@ class SignalConfig:
     # ── Adaptive weights by cycle phase ──────────────────────────
     # Keys are CyclePhase.value strings. Each dict overrides the
     # default weights above. Missing keys fall back to defaults.
-    # Rationale:
-    #   Accumulation/capitulation: RSI oversold + on-chain + cycle dominate
-    #   Growth/early_bull: balanced — technicals matter
-    #   Euphoria/distribution: cycle + MACD divergence dominate
+    # Rationale (MACRO-ERA RECALIBRATION):
+    #   Accumulation/capitulation: RSI oversold + macro liquidity + on-chain dominate.
+    #     macro signal matters most here — QE/rate-cut signals = buy.
+    #   Growth/early_bull: balanced — technicals + macro together.
+    #   Euphoria/distribution: cycle + MACD divergence + macro tightening dominate.
     phase_weight_overrides: dict[str, dict[str, float]] = field(
         default_factory=lambda: {
             "accumulation": {
-                "rsi_weight": 0.25, "cycle_weight": 0.25,
-                "onchain_weight": 0.15, "macd_weight": 0.10,
+                "rsi_weight": 0.22, "macro_weight": 0.18, "cycle_weight": 0.10,
+                "onchain_weight": 0.12, "macd_weight": 0.10,
                 "bollinger_weight": 0.10, "llm_weight": 0.10,
-                "microstructure_weight": 0.05,
+                "microstructure_weight": 0.08,
             },
             "capitulation": {
-                "rsi_weight": 0.25, "cycle_weight": 0.25,
-                "onchain_weight": 0.20, "macd_weight": 0.10,
+                "rsi_weight": 0.22, "macro_weight": 0.20, "cycle_weight": 0.08,
+                "onchain_weight": 0.15, "macd_weight": 0.10,
                 "bollinger_weight": 0.05, "llm_weight": 0.10,
-                "microstructure_weight": 0.05,
+                "microstructure_weight": 0.10,
             },
             "euphoria": {
-                "cycle_weight": 0.30, "macd_weight": 0.20,
+                "cycle_weight": 0.18, "macd_weight": 0.20, "macro_weight": 0.15,
                 "rsi_weight": 0.15, "bollinger_weight": 0.10,
-                "onchain_weight": 0.10, "llm_weight": 0.10,
-                "microstructure_weight": 0.05,
+                "onchain_weight": 0.08, "llm_weight": 0.08,
+                "microstructure_weight": 0.06,
             },
             "distribution": {
-                "cycle_weight": 0.30, "macd_weight": 0.20,
+                "cycle_weight": 0.18, "macd_weight": 0.20, "macro_weight": 0.15,
                 "rsi_weight": 0.15, "bollinger_weight": 0.10,
-                "onchain_weight": 0.10, "llm_weight": 0.10,
-                "microstructure_weight": 0.05,
+                "onchain_weight": 0.08, "llm_weight": 0.08,
+                "microstructure_weight": 0.06,
             },
         }
     )
@@ -230,15 +253,19 @@ class RiskConfig:
     # Daily trade limits
     max_daily_trades: int = 10
 
-    # Drawdown tolerance by phase (from portfolio peak)
+    # Drawdown tolerance by phase (from portfolio peak).
+    # MACRO-ERA RECALIBRATION: values reduced across the board.
+    # Historical drawdowns: ~93% (2011), ~85% (2015/2018), ~77% (2022).
+    # With institutional buying providing floor support, we should not
+    # tolerate as much drawdown — a 77% peak-to-trough is the new "worst case".
     drawdown_tolerance: dict[str, float] = field(default_factory=lambda: {
-        "accumulation": 0.45,
-        "early_bull": 0.35,
-        "growth": 0.30,
-        "euphoria": 0.20,
-        "distribution": 0.15,
-        "early_bear": 0.40,
-        "capitulation": 0.55,  # Max tolerance — prime DCA territory
+        "accumulation": 0.35,   # Was 0.45 — shallower floor expected
+        "early_bull": 0.28,     # Was 0.35
+        "growth": 0.22,         # Was 0.30
+        "euphoria": 0.15,       # Was 0.20 — euphoria pullbacks are sharper now
+        "distribution": 0.12,   # Was 0.15 — tightest tolerance, distribution = exit zone
+        "early_bear": 0.30,     # Was 0.40
+        "capitulation": 0.40,   # Was 0.55 — still highest tolerance, but floor is higher
     })
 
     # Emergency sell: only if below estimated cycle floor (golden rule)
@@ -267,12 +294,15 @@ class SizingConfig:
     min_adjustment: float = 0.25  # Floor: never size below 25% of base
     max_adjustment: float = 3.0   # Ceiling: never size above 3x base
 
-    # Tiered profit taking (default — used when no phase override matches)
+    # Tiered profit taking (default — used when no phase override matches).
+    # MACRO-ERA RECALIBRATION: thresholds lowered.
+    # Cycles are shallower and more elongated — peaks are less extreme,
+    # so we take profit at lower multiples rather than waiting for 2-3x.
     profit_tiers: list[dict[str, float]] = field(default_factory=lambda: [
-        {"threshold": 0.20, "sell_pct": 0.05},   # +20% → sell 5%
-        {"threshold": 0.50, "sell_pct": 0.08},   # +50% → sell 8%
-        {"threshold": 1.00, "sell_pct": 0.12},   # +100% → sell 12%
-        {"threshold": 2.00, "sell_pct": 0.15},   # +200% → sell 15%
+        {"threshold": 0.15, "sell_pct": 0.05},   # +15% → sell 5%  (was +20%)
+        {"threshold": 0.40, "sell_pct": 0.08},   # +40% → sell 8%  (was +50%)
+        {"threshold": 0.80, "sell_pct": 0.12},   # +80% → sell 12% (was +100%)
+        {"threshold": 1.50, "sell_pct": 0.15},   # +150% → sell 15% (was +200%)
     ])
 
     # ── Value averaging ──────────────────────────────────────────
@@ -291,25 +321,28 @@ class SizingConfig:
 
     # ── Phase-aware profit tiers ─────────────────────────────────
     # Override default profit_tiers per cycle phase. Missing phases use default.
-    # Growth: hold longer for bigger gains. Euphoria: take profit faster.
-    # Distribution: aggressive exit before bear market.
+    # MACRO-ERA RECALIBRATION:
+    #   Growth: elongated but shallower — start taking profit earlier.
+    #   Euphoria: institutional distribution is faster than retail cycles;
+    #     be more aggressive taking profit before the floor drops.
+    #   Distribution: tightest tiers — don't let paper gains evaporate.
     phase_profit_tiers: dict[str, list[dict[str, float]]] = field(
         default_factory=lambda: {
             "growth": [
-                {"threshold": 0.30, "sell_pct": 0.03},   # +30% → sell 3%
-                {"threshold": 0.60, "sell_pct": 0.05},   # +60% → sell 5%
-                {"threshold": 1.00, "sell_pct": 0.08},   # +100% → sell 8%
-                {"threshold": 2.00, "sell_pct": 0.12},   # +200% → sell 12%
+                {"threshold": 0.25, "sell_pct": 0.04},   # +25% → sell 4% (was +30%, 3%)
+                {"threshold": 0.50, "sell_pct": 0.06},   # +50% → sell 6% (was +60%, 5%)
+                {"threshold": 0.80, "sell_pct": 0.09},   # +80% → sell 9% (was +100%, 8%)
+                {"threshold": 1.50, "sell_pct": 0.12},   # +150% → sell 12% (was +200%, 12%)
             ],
             "euphoria": [
-                {"threshold": 0.20, "sell_pct": 0.08},   # +20% → sell 8%
-                {"threshold": 0.50, "sell_pct": 0.12},   # +50% → sell 12%
-                {"threshold": 1.00, "sell_pct": 0.18},   # +100% → sell 18%
+                {"threshold": 0.15, "sell_pct": 0.10},   # +15% → sell 10% (was +20%, 8%)
+                {"threshold": 0.35, "sell_pct": 0.15},   # +35% → sell 15% (was +50%, 12%)
+                {"threshold": 0.70, "sell_pct": 0.22},   # +70% → sell 22% (was +100%, 18%)
             ],
             "distribution": [
-                {"threshold": 0.15, "sell_pct": 0.10},   # +15% → sell 10%
-                {"threshold": 0.40, "sell_pct": 0.15},   # +40% → sell 15%
-                {"threshold": 0.80, "sell_pct": 0.20},   # +80% → sell 20%
+                {"threshold": 0.10, "sell_pct": 0.12},   # +10% → sell 12% (was +15%, 10%)
+                {"threshold": 0.30, "sell_pct": 0.18},   # +30% → sell 18% (was +40%, 15%)
+                {"threshold": 0.60, "sell_pct": 0.25},   # +60% → sell 25% (was +80%, 20%)
             ],
         }
     )
@@ -473,7 +506,51 @@ class ATHTracker:
             logger.error(f"Failed to persist ATH: {exc}")
 
 
-# ─── Master config ───────────────────────────────────────────────────────────
+# ─── Macro event config ──────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class MacroEventConfig:
+    """
+    CPI, FOMC, and PCE volatility event parameters.
+
+    Insight: CPI day is a volatility event for BTC, not a directional signal.
+    The initial move = algo/leveraged-trader reaction.
+    The 48h follow-through = what spot buyers actually believe.
+
+    For an accumulation bot:
+      - Pre-event: suppress directional signals, pre-position dip orders
+      - Event day: reduce sizing, hold limit orders in book
+      - Follow-through: re-enable signals + boost dip-buys (hot CPI dips
+        historically get bought back within 2-3 days)
+
+    Stagflation (sticky inflation + slowing growth) is the bear case for BTC.
+    CoinShares 2026 outlook places the stagflation floor near $70k (~€65k).
+    When stagflation keywords dominate LLM themes, apply this floor logic.
+    """
+    # ── Event timing windows ──────────────────────────────────────
+    pre_event_window_hours: float = 2.0    # Suppress signals N hours before event
+    follow_through_window_hours: float = 48.0  # Follow-through observation period
+
+    # ── Signal and size adjustments ───────────────────────────────
+    pre_event_dampening: float = 0.2       # Scale signal to 20% in pre-event window
+    pre_event_size_multiplier: float = 0.3 # Only 30% normal size pre-event
+    event_day_dampening: float = 0.5       # 50% signal dampening on event day
+    event_day_size_multiplier: float = 0.5 # 50% normal size on event day
+
+    # ── Follow-through dip buy boost ─────────────────────────────
+    # If price dips after a CPI/FOMC event, these dips historically recover.
+    # Boost scales with dip magnitude, capped at max.
+    follow_through_dip_boost_max: float = 25.0        # Max score boost points
+    follow_through_dip_boost_sensitivity: float = 2.0  # Score per % dip (×100)
+
+    # ── Stagflation regime ────────────────────────────────────────
+    # CoinShares 2026 outlook: stagflation floor near $70k ≈ €65k
+    # (assuming EURUSD ~1.07 at time of analysis)
+    stagflation_floor_eur: float = 65_000.0
+    stagflation_dampening: float = 0.7       # Additional 30% dampening in stagflation
+    stagflation_size_multiplier: float = 0.7  # Additional 30% size reduction
+    stagflation_detection_threshold: float = 0.25  # Min confidence to declare stagflation
+
 
 @dataclass
 class BotConfig:
@@ -496,6 +573,7 @@ class BotConfig:
     timing: TimingConfig = field(default_factory=TimingConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
+    macro_event: MacroEventConfig = field(default_factory=MacroEventConfig)
 
     # Runtime mode
     paper_trade: bool = False  # Start in paper mode, switch to live explicitly

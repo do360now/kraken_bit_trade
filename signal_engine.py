@@ -28,6 +28,7 @@ from bitcoin_node import OnChainSnapshot
 from config import BotConfig, SignalConfig, CyclePhase, VolatilityRegime
 from cycle_detector import CycleState
 from indicators import TechnicalSnapshot
+from macro_event import MacroEventState
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ class SignalEngine:
         cycle: CycleState,
         onchain: Optional[OnChainSnapshot] = None,
         llm: Optional[LLMContext] = None,
+        macro_event: Optional[MacroEventState] = None,
     ) -> CompositeSignal:
         """
         Generate a composite trading signal.
@@ -162,6 +164,7 @@ class SignalEngine:
             cycle: Current cycle phase analysis.
             onchain: Cached on-chain metrics (may be None if node is down).
             llm: Cached LLM analysis (may be None if Ollama is down).
+            macro_event: CPI/FOMC event state (may be None — treated as no event).
 
         Returns:
             CompositeSignal with score, agreement, action, and component details.
@@ -187,12 +190,50 @@ class SignalEngine:
         # ── LLM sub-signal ───────────────────────────────────────────
         components.append(self._llm_signal(llm, phase_val))
 
+        # ── Macro / global liquidity sub-signal ──────────────────────
+        # In the institutional era, Bitcoin tracks M2 money supply and Fed
+        # policy more than halving cycles. This signal reads LLM themes for
+        # macro keywords (QE, rate cuts, tightening) and scores accordingly.
+        components.append(self._macro_signal(llm, phase_val))
+
         # ── Microstructure sub-signal ────────────────────────────────
         components.append(self._microstructure_signal(snapshot, phase_val))
 
         # ── Composite calculation ────────────────────────────────────
         score, agreement = self._compute_composite(components)
         data_quality = self._assess_data_quality(snapshot, cycle, onchain, llm)
+
+        # ── Macro event overlay ──────────────────────────────────────
+        # Applied AFTER component scoring so it's transparent in logs.
+        # Pre-event: suppress directional signals (dampening near 0).
+        # Follow-through dip: add boost to score (accumulation opportunity).
+        # Stagflation: applies dampening set in macro_event.signal_dampening_factor.
+        if macro_event is not None:
+            if macro_event.suppress_directional_signals:
+                # Force neutral — do not initiate directional trades
+                # but keep the signal object informative for logging
+                score = 0.0
+                agreement = 0.0
+                logger.info(
+                    f"Signal suppressed: {macro_event.description}"
+                )
+            elif macro_event.signal_dampening_factor < 1.0:
+                original = score
+                score *= macro_event.signal_dampening_factor
+                logger.info(
+                    f"Signal dampened: {original:+.1f} → {score:+.1f} "
+                    f"(×{macro_event.signal_dampening_factor:.2f}) — "
+                    f"{macro_event.description}"
+                )
+
+            # Follow-through dip boost: hot CPI dips get bought back
+            if macro_event.dip_buy_boost > 0:
+                score += macro_event.dip_buy_boost
+                logger.info(
+                    f"Follow-through dip boost: +{macro_event.dip_buy_boost:.1f} "
+                    f"({macro_event.description})"
+                )
+
         action = self._determine_action(score, agreement, data_quality)
 
         signal = CompositeSignal(
@@ -527,6 +568,124 @@ class SignalEngine:
 
         return SubSignal(
             name="llm", score=score, weight=self._get_weight("llm", phase_val),
+            direction=direction, reason="; ".join(reasons),
+        )
+
+    def _macro_signal(self, llm: Optional[LLMContext], phase_val: str = '') -> SubSignal:
+        """
+        Global macro / liquidity signal — the new primary driver in the institutional era.
+
+        Bitcoin has become correlated with global M2 money supply and Fed policy.
+        Rising liquidity (QE, rate cuts, M2 expansion) is bullish. Tightening
+        (rate hikes, QT, strong dollar) is bearish. This signal reads the LLM
+        analysis themes for macro keywords and scores the liquidity environment.
+
+        Keyword groups (from LLM themes / regime):
+        - Accommodative: "rate cut", "QE", "quantitative easing", "M2", "liquidity",
+          "dovish", "pivot", "stimulus", "money supply", "easy money"
+        - Restrictive: "rate hike", "QT", "quantitative tightening", "tightening",
+          "hawkish", "inflation", "strong dollar", "high rates", "fed funds"
+
+        Falls back gracefully when LLM is unavailable or stale.
+        """
+        weight = self._get_weight("macro", phase_val)
+
+        if llm is None:
+            return SubSignal(
+                name="macro", score=0.0, weight=weight,
+                direction=0, reason="Macro signal unavailable (no LLM context)",
+            )
+
+        if llm.stale:
+            return SubSignal(
+                name="macro", score=0.0, weight=weight,
+                direction=0, reason="Macro signal stale (LLM context >2h old)",
+            )
+
+        score = 0.0
+        reasons: list[str] = []
+
+        # Keyword sets for macro environment detection
+        accommodative_keywords = {
+            "rate cut", "rate cuts", "cut rates", "qe", "quantitative easing",
+            "m2", "liquidity", "dovish", "pivot", "stimulus", "easy money",
+            "money supply", "money printing", "balance sheet expansion",
+            "fed pause", "pause", "hold rates", "lower rates",
+        }
+        restrictive_keywords = {
+            "rate hike", "rate hikes", "hike rates", "qt", "quantitative tightening",
+            "tightening", "hawkish", "inflation", "strong dollar", "high rates",
+            "fed funds", "restrictive", "tight monetary", "balance sheet reduction",
+        }
+
+        # Scan LLM themes (lower-cased for matching)
+        all_themes_text = " ".join(t.lower() for t in llm.themes)
+        regime_lower = llm.regime.lower()
+
+        # Score accommodative signals
+        accommodative_hits = sum(
+            1 for kw in accommodative_keywords if kw in all_themes_text
+        )
+        restrictive_hits = sum(
+            1 for kw in restrictive_keywords if kw in all_themes_text
+        )
+
+        if accommodative_hits > 0:
+            # Each hit adds to the score, capped at +50
+            score += min(50.0, accommodative_hits * 20.0)
+            reasons.append(f"Macro accommodative signals: {accommodative_hits} theme(s)")
+        if restrictive_hits > 0:
+            score -= min(50.0, restrictive_hits * 20.0)
+            reasons.append(f"Macro restrictive signals: {restrictive_hits} theme(s)")
+
+        # Regime-level macro check (broader context from LLM)
+        macro_bullish_regimes = {"expansion", "recovery", "accumulation", "markup"}
+        macro_bearish_regimes = {"recession", "contraction", "tightening", "stagflation"}
+        if regime_lower in macro_bullish_regimes:
+            score += 15.0
+            reasons.append(f"Macro regime bullish: {llm.regime}")
+        elif regime_lower in macro_bearish_regimes:
+            score -= 15.0
+            reasons.append(f"Macro regime bearish: {llm.regime}")
+
+        # ── Stagflation overlay ───────────────────────────────────────
+        # Sticky inflation + slowing growth = ambiguous-to-bearish for BTC.
+        # CoinShares 2026 outlook: stagflation floor ~$70k (~€65k).
+        # This is not a pure sell signal for an accumulation bot — below the floor
+        # it's actually an accumulation opportunity — but above the floor it
+        # suppresses upside potential.
+        stagflation_keywords = {
+            "stagflation", "stagflationary", "oil shock", "energy shock",
+            "sticky inflation", "persistent inflation", "iran oil", "supply shock",
+        }
+        stagflation_hits = sum(1 for kw in stagflation_keywords if kw in all_themes_text)
+        if stagflation_hits >= 2:
+            stag_penalty = min(30.0, stagflation_hits * 12.0)
+            score -= stag_penalty
+            reasons.append(
+                f"Stagflation signals ({stagflation_hits} hits) — "
+                f"ambiguous for BTC, floor ~€65k; penalty {-stag_penalty:.0f}"
+            )
+        elif stagflation_hits == 1:
+            score -= 10.0
+            reasons.append("Stagflation risk present (1 signal) — monitoring")
+
+        # Risk level from LLM as macro overlay
+        # High macro risk (central bank tightening) = sell signal even for accumulation bot
+        macro_risk_adj = {"low": 10.0, "medium": 0.0, "high": -20.0, "extreme": -35.0}
+        risk_adj = macro_risk_adj.get(llm.risk_level, 0.0)
+        if risk_adj != 0.0:
+            score += risk_adj
+            reasons.append(f"Macro risk level: {llm.risk_level} ({risk_adj:+.0f})")
+
+        if not reasons:
+            reasons.append("No macro keywords detected — neutral")
+
+        score = max(-100.0, min(100.0, score))
+        direction = 1 if score > 5 else (-1 if score < -5 else 0)
+
+        return SubSignal(
+            name="macro", score=score, weight=weight,
             direction=direction, reason="; ".join(reasons),
         )
 
