@@ -226,13 +226,21 @@ class SignalEngine:
                     f"{macro_event.description}"
                 )
 
-            # Follow-through dip boost: hot CPI dips get bought back
+            # Floor boost: covers both follow-through dips AND below-stagflation-floor.
+            # Both accumulate into dip_buy_boost in MacroEventState.
             if macro_event.dip_buy_boost > 0:
                 score += macro_event.dip_buy_boost
-                logger.info(
-                    f"Follow-through dip boost: +{macro_event.dip_buy_boost:.1f} "
-                    f"({macro_event.description})"
-                )
+                if macro_event.below_stagflation_floor:
+                    logger.info(
+                        f"Stagflation floor boost: +{macro_event.dip_buy_boost:.1f} "
+                        f"(price below €{macro_event.stagflation_floor_eur:,.0f} — "
+                        f"accumulation territory)"
+                    )
+                else:
+                    logger.info(
+                        f"Follow-through dip boost: +{macro_event.dip_buy_boost:.1f} "
+                        f"({macro_event.description})"
+                    )
 
         action = self._determine_action(score, agreement, data_quality)
 

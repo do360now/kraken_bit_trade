@@ -90,6 +90,9 @@ class MacroEventState:
     is_stagflation_regime: bool
     stagflation_confidence: float       # 0.0–1.0: how confident we are
     stagflation_floor_eur: float        # Estimated downside floor in this regime
+    below_stagflation_floor: bool       # True when current price < floor
+    # When below_stagflation_floor: dampening is removed, floor_boost is added to score.
+    # The floor IS the accumulation opportunity — limited further downside from here.
 
     # Human-readable context
     description: str
@@ -110,6 +113,7 @@ def _no_event() -> MacroEventState:
         is_stagflation_regime=False,
         stagflation_confidence=0.0,
         stagflation_floor_eur=0.0,
+        below_stagflation_floor=False,
         description="No macro event nearby",
     )
 
@@ -229,7 +233,7 @@ class MacroEventDetector:
         dampening = 1.0
         size_mult = 1.0
         pre_pos_dip = False
-        dip_boost = 0.0
+        dip_buy_boost = 0.0
         description_parts: list[str] = []
 
         if phase == EventPhase.PRE_EVENT:
@@ -259,13 +263,13 @@ class MacroEventDetector:
                     and current_price < price_at_last_event):
                 dip_pct = (price_at_last_event - current_price) / price_at_last_event
                 # Boost scales with dip magnitude, capped at configured max
-                dip_boost = min(
+                dip_buy_boost = min(
                     self._cfg.follow_through_dip_boost_max,
                     dip_pct * self._cfg.follow_through_dip_boost_sensitivity * 100,
                 )
                 description_parts.append(
                     f"FOLLOW-THROUGH: {event_type.value.upper()} was {hours_since:.0f}h ago, "
-                    f"price dipped {dip_pct:.1%} — dip boost +{dip_boost:.1f}"
+                    f"price dipped {dip_pct:.1%} — dip boost +{dip_buy_boost:.1f}"
                 )
             else:
                 description_parts.append(
@@ -278,15 +282,57 @@ class MacroEventDetector:
             llm_themes, llm_regime,
         )
 
+        below_floor = False
+        floor_eur = self._cfg.stagflation_floor_eur if is_stagflation else 0.0
+
         if is_stagflation:
-            # During stagflation, apply additional dampening
-            dampening *= self._cfg.stagflation_dampening
-            size_mult *= self._cfg.stagflation_size_multiplier
-            description_parts.append(
-                f"STAGFLATION regime (conf={stagflation_conf:.2f}) — "
-                f"floor ≈€{self._cfg.stagflation_floor_eur:,.0f}, "
-                f"sizing reduced"
+            below_floor = (
+                current_price is not None
+                and current_price < self._cfg.stagflation_floor_eur
             )
+
+            if below_floor:
+                # ── BELOW STAGFLATION FLOOR: accumulation territory ───
+                # CoinShares thesis: the floor (~€65k) represents limited
+                # further downside. Being below it is the accumulation
+                # opportunity, not a reason to reduce sizing further.
+                #
+                # Logic inversion:
+                #   ABOVE floor → dampen (uncertainty, downside risk remains)
+                #   BELOW floor → floor boost (limited further downside, buy)
+                #
+                # Size is still cautious (0.85x) — stagflation is ambiguous —
+                # but dampening is removed and a floor bonus is added to score.
+                dip_below_pct = (
+                    (self._cfg.stagflation_floor_eur - current_price)
+                    / self._cfg.stagflation_floor_eur
+                )
+                floor_bonus = min(
+                    self._cfg.stagflation_floor_boost,
+                    dip_below_pct * 200,  # 1% below floor = +2 pts, caps at floor_boost
+                )
+                dip_buy_boost += floor_bonus
+                # Reduce size slightly but do NOT dampen signals
+                size_mult *= self._cfg.stagflation_below_floor_size_multiplier
+                description_parts.append(
+                    f"BELOW STAGFLATION FLOOR €{self._cfg.stagflation_floor_eur:,.0f} "
+                    f"by {dip_below_pct:.1%} — accumulation territory, "
+                    f"floor boost +{floor_bonus:.1f}, limited further downside "
+                    f"(CoinShares stagflation thesis)"
+                )
+            else:
+                # Above floor: apply dampening — downside risk to floor still exists
+                dampening *= self._cfg.stagflation_dampening
+                size_mult *= self._cfg.stagflation_size_multiplier
+                distance_pct = (
+                    (current_price - self._cfg.stagflation_floor_eur)
+                    / self._cfg.stagflation_floor_eur
+                ) if current_price else 0.0
+                description_parts.append(
+                    f"STAGFLATION regime (conf={stagflation_conf:.2f}) — "
+                    f"{distance_pct:.1%} above floor €{self._cfg.stagflation_floor_eur:,.0f}, "
+                    f"downside risk present, signals dampened"
+                )
 
         description = "; ".join(description_parts) if description_parts else "No macro event nearby"
 
@@ -302,10 +348,11 @@ class MacroEventDetector:
             signal_dampening_factor=dampening,
             size_multiplier=size_mult,
             pre_position_for_dip=pre_pos_dip,
-            dip_buy_boost=dip_boost,
+            dip_buy_boost=dip_buy_boost,
             is_stagflation_regime=is_stagflation,
             stagflation_confidence=stagflation_conf,
-            stagflation_floor_eur=self._cfg.stagflation_floor_eur if is_stagflation else 0.0,
+            stagflation_floor_eur=floor_eur,
+            below_stagflation_floor=below_floor,
             description=description,
         )
 

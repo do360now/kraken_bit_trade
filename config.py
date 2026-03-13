@@ -547,9 +547,15 @@ class MacroEventConfig:
     # CoinShares 2026 outlook: stagflation floor near $70k ≈ €65k
     # (assuming EURUSD ~1.07 at time of analysis)
     stagflation_floor_eur: float = 65_000.0
-    stagflation_dampening: float = 0.7       # Additional 30% dampening in stagflation
-    stagflation_size_multiplier: float = 0.7  # Additional 30% size reduction
+    stagflation_dampening: float = 0.7       # Additional 30% dampening ABOVE floor
+    stagflation_size_multiplier: float = 0.7  # Additional 30% size reduction ABOVE floor
     stagflation_detection_threshold: float = 0.25  # Min confidence to declare stagflation
+    # ── Below-floor accumulation logic ───────────────────────────
+    # When price is already below the stagflation floor, the thesis inverts:
+    # limited further downside → accumulate. Dampening is lifted, a floor
+    # bonus is added to the composite score, and size is cautiously maintained.
+    stagflation_floor_boost: float = 20.0          # Max score boost when below floor
+    stagflation_below_floor_size_multiplier: float = 0.85  # Slightly cautious still
 
 
 @dataclass
