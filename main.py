@@ -301,15 +301,23 @@ class Bot:
         # 4c. Check for positive divergence and boost signal if detected
         divergence_boost = self._check_divergence(ticker.last, composite.score)
         if divergence_boost > 0:
-            # Apply boost by creating a modified signal
+            # Apply boost by creating a modified signal.
+            # IMPORTANT: also recalculate action — the pre-boost action was
+            # computed on the unboosted score and may still be HOLD even when
+            # the boosted score crosses the buy threshold.
             original_score = composite.score
+            boosted_score = composite.score + divergence_boost
+            boosted_action = self._signal_engine.action_for_score(
+                boosted_score, composite.agreement, composite.data_quality,
+            )
             composite = dataclasses.replace(
                 composite,
-                score=composite.score + divergence_boost,
+                score=boosted_score,
+                action=boosted_action,
             )
             logger.info(
                 f"Signal boosted: {original_score:.1f} -> {composite.score:.1f} "
-                f"(+{divergence_boost} divergence)"
+                f"(+{divergence_boost} divergence) action={boosted_action.value}"
             )
 
         # 5. Build portfolio state

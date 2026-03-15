@@ -262,6 +262,18 @@ class SignalEngine:
 
     # ─── Sub-signal generators ───────────────────────────────────────────
 
+    def action_for_score(
+        self, score: float, agreement: float, data_quality: float,
+    ) -> Action:
+        """
+        Public wrapper around _determine_action.
+
+        Used by main.py to recalculate action after an external score boost
+        (e.g. divergence boost) without re-running the full signal pipeline.
+        Ensures action always reflects the final score, not the pre-boost score.
+        """
+        return self._determine_action(score, agreement, data_quality)
+
     def _rsi_signal(self, snapshot: TechnicalSnapshot, cycle: CycleState, phase_val: str = '') -> SubSignal:
         """
         RSI-based signal with cycle-aware interpretation.
